@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import nacl from 'tweetnacl'
 
 type User = { id:number; username:string; role:string; active:boolean; password_change_required:boolean; created_at:string }
 type Task = { id:string; user_id:number; prompt:string; status:string; codex_session_id?:string; final_output:string; error:string; created_at:string; updated_at:string; diff?:string; events?:any[] }
@@ -44,6 +45,25 @@ async function api(path:string, options:RequestInit={}) {
   if(!r.ok) throw new Error(formatError(body)||`HTTP ${r.status}`)
   return body
 }
+function bytesToBase64(bytes:Uint8Array):string{
+  let binary=''
+  for(const byte of bytes)binary+=String.fromCharCode(byte)
+  return btoa(binary)
+}
+function base64ToBytes(value:string):Uint8Array{
+  const binary=atob(value)
+  const bytes=new Uint8Array(binary.length)
+  for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i)
+  return bytes
+}
+async function encryptSecret(payload:Record<string,string>){
+  const challenge=await api('/api/auth/crypto/challenge')
+  const ephemeral=nacl.box.keyPair()
+  const nonce=nacl.randomBytes(nacl.box.nonceLength)
+  const plaintext=new TextEncoder().encode(JSON.stringify({...payload,challenge_id:challenge.challenge_id}))
+  const ciphertext=nacl.box(plaintext,nonce,base64ToBytes(challenge.public_key),ephemeral.secretKey)
+  return {key_id:challenge.key_id,challenge_id:challenge.challenge_id,ephemeral_public_key:bytesToBase64(ephemeral.publicKey),nonce:bytesToBase64(nonce),ciphertext:bytesToBase64(ciphertext)}
+}
 async function init(){
   loading.value=true
   try {
@@ -52,9 +72,9 @@ async function init(){
     if(user.value && !user.value.password_change_required) await loadAll()
   } catch(e:any){error.value=formatError(e);ElMessage.error(error.value)} finally{loading.value=false}
 }
-async function bootstrap(){try{await api('/api/setup/bootstrap',{method:'POST',body:JSON.stringify(setupForm.value)});ElMessage.success('管理员已创建，请登录');setupNeeded.value=false;setupForm.value.token=''}catch(e:any){ElMessage.error(formatError(e))}}
-async function login(){try{const x=await api('/api/auth/login',{method:'POST',body:JSON.stringify(loginForm.value)});user.value=x.user;csrf.value=x.csrf_token;loginForm.value.password='';if(user.value?.password_change_required){passwordForm.value.current_password='';return}await loadAll()}catch(e:any){ElMessage.error(formatError(e))}}
-async function changePassword(){try{const x=await api('/api/auth/password',{method:'POST',body:JSON.stringify(passwordForm.value)});user.value=x.user;passwordForm.value={current_password:'',new_password:''};ElMessage.success('密码已更新');await loadAll()}catch(e:any){ElMessage.error(formatError(e))}}
+async function bootstrap(){try{const secret=await encryptSecret({token:setupForm.value.token,password:setupForm.value.password});await api('/api/setup/bootstrap',{method:'POST',body:JSON.stringify({username:setupForm.value.username,secret})});ElMessage.success('管理员已创建，请登录');setupNeeded.value=false;setupForm.value.token=''}catch(e:any){ElMessage.error(formatError(e))}}
+async function login(){try{const secret=await encryptSecret({password:loginForm.value.password});const x=await api('/api/auth/login',{method:'POST',body:JSON.stringify({username:loginForm.value.username,secret})});user.value=x.user;csrf.value=x.csrf_token;loginForm.value.password='';if(user.value?.password_change_required){passwordForm.value.current_password='';return}await loadAll()}catch(e:any){ElMessage.error(formatError(e))}}
+async function changePassword(){try{const secret=await encryptSecret(passwordForm.value);const x=await api('/api/auth/password',{method:'POST',body:JSON.stringify({secret})});user.value=x.user;passwordForm.value={current_password:'',new_password:''};ElMessage.success('密码已更新');await loadAll()}catch(e:any){ElMessage.error(formatError(e))}}
 async function logout(){try{await api('/api/auth/logout',{method:'POST'})}catch{}if(source)source.close();user.value=null;csrf.value='';selected.value=null;tasks.value=[]}
 async function loadAll(){await Promise.all([loadTasks(),loadSystem()]);if(isAdmin.value)await loadUsers();if(!refreshTimer)refreshTimer=setInterval(()=>{loadTasks();loadSystem()},5000)}
 async function loadTasks(){try{tasks.value=await api('/api/tasks');if(selected.value){const latest=tasks.value.find(t=>t.id===selected.value?.id);if(latest)selected.value=latest}}catch(e:any){if(e.message.includes('登录'))logout()}}

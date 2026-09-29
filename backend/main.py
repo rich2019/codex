@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import os
@@ -16,6 +17,8 @@ from argon2.exceptions import VerifyMismatchError
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
+from nacl.exceptions import CryptoError
+from nacl.public import Box, PrivateKey, PublicKey
 from pydantic import BaseModel, Field
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, create_engine, func, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
@@ -31,6 +34,7 @@ BOOTSTRAP_TOKEN = os.getenv('BOOTSTRAP_TOKEN', '')
 CODEX_STATUS_FILE = Path(os.getenv('CODEX_STATUS_FILE', '/state/codex_status.json'))
 WORKSPACE = Path(os.getenv('CODEX_WORKSPACE', '/srv/codex/repo'))
 WORKTREES = Path(os.getenv('CODEX_WORKTREES', '/srv/codex/worktrees'))
+CRYPTO_KEY_FILE = Path(os.getenv('CODEX_CRYPTO_KEY_FILE', '/home/codex/.codex/console-crypto-key'))
 ph = PasswordHasher()
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=3, max_overflow=2, pool_recycle=1800)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
@@ -90,7 +94,98 @@ VALIDATION_LABELS = {
     'username': '用户名',
     'role': '角色',
     'prompt': '任务描述',
+    'secret': '加密认证信息',
 }
+
+CRYPTO_CHALLENGE_TTL = 120
+crypto_lock = threading.Lock()
+crypto_private_key: PrivateKey | None = None
+crypto_challenges: dict[str, float] = {}
+
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode('ascii')
+
+def _unb64(value: str, field: str) -> bytes:
+    try:
+        return base64.b64decode(value, validate=True)
+    except Exception:
+        raise HTTPException(400, f'{field}格式不正确')
+
+def crypto_key() -> PrivateKey:
+    global crypto_private_key
+    with crypto_lock:
+        if crypto_private_key is not None:
+            return crypto_private_key
+        CRYPTO_KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            raw = CRYPTO_KEY_FILE.read_bytes()
+            private = PrivateKey(raw)
+        except FileNotFoundError:
+            private = PrivateKey.generate()
+            temporary = CRYPTO_KEY_FILE.with_name(CRYPTO_KEY_FILE.name + '.tmp')
+            temporary.write_bytes(bytes(private))
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, CRYPTO_KEY_FILE)
+        except Exception as exc:
+            raise RuntimeError(f'无法读取 Codex 控制台加密密钥: {exc}')
+        os.chmod(CRYPTO_KEY_FILE, 0o600)
+        crypto_private_key = private
+        return private
+
+def crypto_key_id(private: PrivateKey) -> str:
+    return hashlib.sha256(bytes(private.public_key)).hexdigest()[:16]
+
+def issue_crypto_challenge() -> dict:
+    private = crypto_key()
+    now = time.time()
+    challenge_id = secrets.token_urlsafe(32)
+    with crypto_lock:
+        for key, expires_at in list(crypto_challenges.items()):
+            if expires_at <= now:
+                crypto_challenges.pop(key, None)
+        crypto_challenges[challenge_id] = now + CRYPTO_CHALLENGE_TTL
+    return {
+        'challenge_id': challenge_id,
+        'key_id': crypto_key_id(private),
+        'public_key': _b64(bytes(private.public_key)),
+        'expires_in': CRYPTO_CHALLENGE_TTL,
+    }
+
+def decrypt_secret(secret: 'SecretEnvelope') -> dict:
+    private = crypto_key()
+    if secret.key_id != crypto_key_id(private):
+        raise HTTPException(400, '加密密钥已更新，请重试')
+    now = time.time()
+    with crypto_lock:
+        expires_at = crypto_challenges.get(secret.challenge_id)
+        if not expires_at or expires_at <= now:
+            crypto_challenges.pop(secret.challenge_id, None)
+            raise HTTPException(409, '加密挑战已过期或已使用，请重试')
+    ephemeral = _unb64(secret.ephemeral_public_key, '临时公钥')
+    nonce = _unb64(secret.nonce, '加密随机数')
+    ciphertext = _unb64(secret.ciphertext, '密文')
+    if len(ephemeral) != PrivateKey.SIZE or len(nonce) != Box.NONCE_SIZE:
+        raise HTTPException(400, '加密参数长度不正确')
+    try:
+        plaintext = Box(private, PublicKey(ephemeral)).decrypt(ciphertext, nonce)
+        payload = json.loads(plaintext.decode('utf-8'))
+    except (CryptoError, UnicodeDecodeError, json.JSONDecodeError):
+        raise HTTPException(400, '加密认证信息无法解密，请重试')
+    if not isinstance(payload, dict) or payload.get('challenge_id') != secret.challenge_id:
+        raise HTTPException(400, '加密挑战校验失败，请重试')
+    with crypto_lock:
+        expires_at = crypto_challenges.get(secret.challenge_id)
+        if not expires_at or expires_at <= time.time():
+            crypto_challenges.pop(secret.challenge_id, None)
+            raise HTTPException(409, '加密挑战已过期或已使用，请重试')
+        crypto_challenges.pop(secret.challenge_id, None)
+    return payload
+
+def secret_text(payload: dict, key: str, label: str) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value:
+        raise HTTPException(422, f'{label}不能为空')
+    return value
 
 def validation_error_message(exc: RequestValidationError) -> str:
     messages = []
@@ -155,18 +250,23 @@ def verify_csrf(request: Request, x_csrf_token: str | None):
     if not row or not x_csrf_token or not secrets.compare_digest(row.csrf_token, x_csrf_token):
         raise HTTPException(403, 'CSRF 校验失败')
 
+class SecretEnvelope(BaseModel):
+    key_id: str = Field(min_length=8, max_length=64)
+    challenge_id: str = Field(min_length=20, max_length=128)
+    ephemeral_public_key: str = Field(min_length=32, max_length=128)
+    nonce: str = Field(min_length=24, max_length=128)
+    ciphertext: str = Field(min_length=16, max_length=200000)
+
 class BootstrapIn(BaseModel):
-    token: str
     username: str = Field(min_length=3, max_length=64, pattern=r'^[a-zA-Z0-9_.-]+$')
-    password: str = Field(min_length=1)
+    secret: SecretEnvelope
 
 class LoginIn(BaseModel):
     username: str
-    password: str
+    secret: SecretEnvelope
 
 class PasswordIn(BaseModel):
-    current_password: str = ''
-    new_password: str = Field(min_length=1)
+    secret: SecretEnvelope
 
 class UserCreateIn(BaseModel):
     username: str = Field(min_length=3, max_length=64, pattern=r'^[a-zA-Z0-9_.-]+$')
@@ -210,6 +310,7 @@ def startup():
     for _ in range(30):
         try:
             Base.metadata.create_all(engine)
+            crypto_key()
             return
         except Exception:
             time.sleep(2)
@@ -227,19 +328,28 @@ def health(db: Session = Depends(db_dep)):
 def setup_status(db: Session = Depends(db_dep)):
     return {'needs_admin': db.scalar(select(func.count(User.id))) == 0}
 
+@app.get('/api/auth/crypto/challenge')
+def crypto_challenge():
+    return issue_crypto_challenge()
+
 @app.post('/api/setup/bootstrap')
 def bootstrap(data: BootstrapIn, db: Session = Depends(db_dep)):
-    if not BOOTSTRAP_TOKEN or not secrets.compare_digest(data.token, BOOTSTRAP_TOKEN):
+    payload = decrypt_secret(data.secret)
+    token = secret_text(payload, 'token', '初始化令牌')
+    password = secret_text(payload, 'password', '密码')
+    if not BOOTSTRAP_TOKEN or not secrets.compare_digest(token, BOOTSTRAP_TOKEN):
         raise HTTPException(403, '初始化令牌错误')
     if db.scalar(select(func.count(User.id))) != 0:
         raise HTTPException(409, '管理员已初始化')
-    u = User(username=data.username, password_hash=ph.hash(data.password), role='admin')
+    u = User(username=data.username, password_hash=ph.hash(password), role='admin')
     db.add(u)
     db.commit()
     return {'ok': True}
 
 @app.post('/api/auth/login')
 def login(data: LoginIn, request: Request, response: Response, db: Session = Depends(db_dep)):
+    payload = decrypt_secret(data.secret)
+    password = secret_text(payload, 'password', '密码')
     ip = request.headers.get('x-real-ip', request.client.host if request.client else 'unknown')
     key = f'{ip}:{data.username.lower()}'
     now = time.time()
@@ -250,7 +360,7 @@ def login(data: LoginIn, request: Request, response: Response, db: Session = Dep
     ok = False
     if u and u.active:
         try:
-            ok = ph.verify(u.password_hash, data.password)
+            ok = ph.verify(u.password_hash, password)
         except VerifyMismatchError:
             ok = False
     if not ok:
@@ -282,13 +392,16 @@ def me(request: Request, u: User = Depends(current_user)):
 @app.post('/api/auth/password')
 def change_password(data: PasswordIn, request: Request, x_csrf_token: str | None = Header(default=None), db: Session = Depends(db_dep), u: User = Depends(current_user)):
     verify_csrf(request, x_csrf_token)
+    payload = decrypt_secret(data.secret)
+    current_password = secret_text(payload, 'current_password', '当前密码') if not u.password_change_required else ''
+    new_password = secret_text(payload, 'new_password', '新密码')
     if not u.password_change_required:
         try:
-            if not ph.verify(u.password_hash, data.current_password):
+            if not ph.verify(u.password_hash, current_password):
                 raise HTTPException(400, '当前密码不正确')
         except VerifyMismatchError:
             raise HTTPException(400, '当前密码不正确')
-    u.password_hash = ph.hash(data.new_password)
+    u.password_hash = ph.hash(new_password)
     u.password_change_required = False
     db.commit()
     return {'ok': True, 'user': user_json(u)}
