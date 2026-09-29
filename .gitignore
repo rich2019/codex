@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+state/
+backend/__pycache__/
+frontend/node_modules/
+frontend/dist/
+*.pyc
+*.tmp
+work/
+certbot/
+letsencrypt/

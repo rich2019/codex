@@ -1,0 +1,89 @@
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    command: ["--innodb-buffer-pool-size=128M", "--max-connections=15", "--performance-schema=OFF", "--innodb-log-buffer-size=8M", "--character-set-server=utf8mb4", "--collation-server=utf8mb4_0900_ai_ci"]
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-codex_console}
+      MYSQL_USER: ${MYSQL_USER:-codex_app}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+    mem_limit: 480m
+    networks: [backend]
+  api:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-codex_console}
+      MYSQL_USER: ${MYSQL_USER:-codex_app}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      BOOTSTRAP_TOKEN: ${BOOTSTRAP_TOKEN}
+      COOKIE_SECURE: "false"
+      CODEX_STATUS_FILE: /state/codex_status.json
+      CODEX_WORKSPACE: /srv/codex/repo
+      CODEX_WORKTREES: /srv/codex/worktrees
+    volumes:
+      - ./state:/state:ro
+      - codex_auth:/home/codex/.codex
+      - /srv/codex:/srv/codex:ro
+    depends_on:
+      mysql: { condition: service_healthy }
+    mem_limit: 160m
+    networks: [backend]
+  worker:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    command: ["python", "worker.py"]
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-codex_console}
+      MYSQL_USER: ${MYSQL_USER:-codex_app}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      CODEX_STATUS_FILE: /state/codex_status.json
+      CODEX_WORKSPACE: /srv/codex/repo
+      CODEX_WORKTREES: /srv/codex/worktrees
+      MAX_TASK_SECONDS: "7200"
+    volumes:
+      - codex_auth:/home/codex/.codex
+      - ./state:/state
+      - /srv/codex:/srv/codex
+    depends_on:
+      mysql: { condition: service_healthy }
+    mem_limit: 384m
+    networks: [backend]
+  gateway:
+    build:
+      context: ./frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/http.conf:/etc/nginx/conf.d/default.conf:ro
+      - acme_webroot:/var/www/certbot:ro
+    depends_on: [api]
+    mem_limit: 48m
+    networks: [backend]
+  certbot:
+    image: certbot/certbot:latest
+    profiles: [tools]
+    volumes:
+      - letsencrypt:/etc/letsencrypt
+      - acme_webroot:/var/www/certbot
+volumes:
+  mysql_data:
+  codex_auth:
+  letsencrypt:
+  acme_webroot:
+networks:
+  backend:
