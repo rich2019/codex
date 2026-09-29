@@ -10,13 +10,38 @@ const tasks=ref<Task[]>([]), selected=ref<Task|null>(null), prompt=ref(''), even
 let source:EventSource|null=null, refreshTimer:any=null, codexPoll:any=null
 const deviceLogin=ref<any>({running:false,authenticated:false,device_url:'',user_code:'',message:''})
 const isAdmin=computed(()=>user.value?.role==='admin')
+const errorLabels:Record<string,string>={password:'密码',new_password:'新密码',current_password:'当前密码',token:'初始化令牌',username:'用户名',role:'角色',prompt:'任务描述'}
+function formatError(value:any):string{
+  if(value instanceof Error)return value.message||'请求失败'
+  if(typeof value==='string')return value
+  if(value==null)return '请求失败'
+  if(Array.isArray(value))return value.map(formatError).filter(Boolean).join('；')||'请求失败'
+  if(typeof value==='object'){
+    if(typeof value.detail==='string')return value.detail
+    if(value.detail)return formatError(value.detail)
+    if(typeof value.message==='string')return value.message
+    if(typeof value.msg==='string'){
+      const loc=Array.isArray(value.loc)?value.loc.filter((x:any)=>x!=='body'):[]
+      const field=String(loc[loc.length-1]||'')
+      const label=errorLabels[field]||field
+      if(value.type==='missing'||value.type==='string_too_short')return `${label||'参数'}不能为空`
+      if(value.type==='string_too_long')return `${label||'参数'}过长`
+      if(value.type==='string_pattern_mismatch')return `${label||'参数'}格式不正确`
+      return label?`${label}${value.msg}`:value.msg
+    }
+    try{return JSON.stringify(value)}catch{return '请求失败'}
+  }
+  return String(value)
+}
 async function api(path:string, options:RequestInit={}) {
   const headers=new Headers(options.headers||{})
   if(options.body && !headers.has('Content-Type')) headers.set('Content-Type','application/json')
   if(csrf.value && !['GET','HEAD'].includes((options.method||'GET').toUpperCase())) headers.set('X-CSRF-Token',csrf.value)
   const r=await fetch(path,{...options,headers,credentials:'same-origin'})
-  const body=await r.json().catch(()=>({detail:r.statusText}))
-  if(!r.ok) throw new Error(body.detail||`HTTP ${r.status}`)
+  const text=await r.text()
+  let body:any=null
+  try{body=text?JSON.parse(text):null}catch{body={detail:text||r.statusText}}
+  if(!r.ok) throw new Error(formatError(body)||`HTTP ${r.status}`)
   return body
 }
 async function init(){
@@ -25,27 +50,27 @@ async function init(){
     const s=await api('/api/setup/status'); setupNeeded.value=s.needs_admin
     if(!setupNeeded.value){try{const m=await api('/api/auth/me');user.value=m.user;csrf.value=m.csrf_token}catch{user.value=null}}
     if(user.value && !user.value.password_change_required) await loadAll()
-  } catch(e:any){error.value=e.message} finally{loading.value=false}
+  } catch(e:any){error.value=formatError(e);ElMessage.error(error.value)} finally{loading.value=false}
 }
-async function bootstrap(){try{await api('/api/setup/bootstrap',{method:'POST',body:JSON.stringify(setupForm.value)});ElMessage.success('管理员已创建，请登录');setupNeeded.value=false;setupForm.value.token=''}catch(e:any){ElMessage.error(e.message)}}
-async function login(){try{const x=await api('/api/auth/login',{method:'POST',body:JSON.stringify(loginForm.value)});user.value=x.user;csrf.value=x.csrf_token;loginForm.value.password='';if(user.value?.password_change_required){passwordForm.value.current_password='';return}await loadAll()}catch(e:any){ElMessage.error(e.message)}}
-async function changePassword(){try{const x=await api('/api/auth/password',{method:'POST',body:JSON.stringify(passwordForm.value)});user.value=x.user;passwordForm.value={current_password:'',new_password:''};ElMessage.success('密码已更新');await loadAll()}catch(e:any){ElMessage.error(e.message)}}
+async function bootstrap(){try{await api('/api/setup/bootstrap',{method:'POST',body:JSON.stringify(setupForm.value)});ElMessage.success('管理员已创建，请登录');setupNeeded.value=false;setupForm.value.token=''}catch(e:any){ElMessage.error(formatError(e))}}
+async function login(){try{const x=await api('/api/auth/login',{method:'POST',body:JSON.stringify(loginForm.value)});user.value=x.user;csrf.value=x.csrf_token;loginForm.value.password='';if(user.value?.password_change_required){passwordForm.value.current_password='';return}await loadAll()}catch(e:any){ElMessage.error(formatError(e))}}
+async function changePassword(){try{const x=await api('/api/auth/password',{method:'POST',body:JSON.stringify(passwordForm.value)});user.value=x.user;passwordForm.value={current_password:'',new_password:''};ElMessage.success('密码已更新');await loadAll()}catch(e:any){ElMessage.error(formatError(e))}}
 async function logout(){try{await api('/api/auth/logout',{method:'POST'})}catch{}if(source)source.close();user.value=null;csrf.value='';selected.value=null;tasks.value=[]}
 async function loadAll(){await Promise.all([loadTasks(),loadSystem()]);if(isAdmin.value)await loadUsers();if(!refreshTimer)refreshTimer=setInterval(()=>{loadTasks();loadSystem()},5000)}
 async function loadTasks(){try{tasks.value=await api('/api/tasks');if(selected.value){const latest=tasks.value.find(t=>t.id===selected.value?.id);if(latest)selected.value=latest}}catch(e:any){if(e.message.includes('登录'))logout()}}
 async function loadSystem(){try{system.value=await api('/api/system/status')}catch{}}
-async function loadUsers(){try{users.value=await api('/api/admin/users')}catch(e:any){ElMessage.error(e.message)}}
+async function loadUsers(){try{users.value=await api('/api/admin/users')}catch(e:any){ElMessage.error(formatError(e))}}
 async function refreshCodexLogin(){try{deviceLogin.value=await api('/api/admin/codex/login/status');if(deviceLogin.value.authenticated){if(codexPoll)clearInterval(codexPoll);codexPoll=null;await loadSystem();ElMessage.success('ChatGPT 账号已连接')}}catch{}}
-async function startCodexLogin(){try{deviceLogin.value=await api('/api/admin/codex/login/start',{method:'POST'});if(!codexPoll)codexPoll=setInterval(refreshCodexLogin,2000)}catch(e:any){ElMessage.error(e.message)}}
-async function cancelCodexLogin(){try{deviceLogin.value=await api('/api/admin/codex/login/cancel',{method:'POST'});if(codexPoll)clearInterval(codexPoll);codexPoll=null}catch(e:any){ElMessage.error(e.message)}}
-async function createTask(){if(!prompt.value.trim())return;try{const t=await api('/api/tasks',{method:'POST',body:JSON.stringify({prompt:prompt.value.trim()})});prompt.value='';await loadTasks();await openTask(t.id)}catch(e:any){ElMessage.error(e.message)}}
-async function openTask(id:string){if(source){source.close();source=null}try{selected.value=await api(`/api/tasks/${id}`);events.value=selected.value?.events||[];source=new EventSource(`/api/tasks/${id}/events?after=${events.value.length}`,{withCredentials:true});source.onmessage=(ev)=>{try{const x=JSON.parse(ev.data);events.value.push(x);if(x.type==='thread.started'&&selected.value){selected.value.codex_session_id=x.data.thread_id||selected.value.codex_session_id}loadTasks()}catch{}};source.addEventListener('end',()=>{source?.close();source=null;loadTasks();openTaskData(id)});source.onerror=()=>{source?.close();source=null;loadTasks()}}catch(e:any){ElMessage.error(e.message)}}
+async function startCodexLogin(){try{deviceLogin.value=await api('/api/admin/codex/login/start',{method:'POST'});if(!codexPoll)codexPoll=setInterval(refreshCodexLogin,2000)}catch(e:any){ElMessage.error(formatError(e))}}
+async function cancelCodexLogin(){try{deviceLogin.value=await api('/api/admin/codex/login/cancel',{method:'POST'});if(codexPoll)clearInterval(codexPoll);codexPoll=null}catch(e:any){ElMessage.error(formatError(e))}}
+async function createTask(){if(!prompt.value.trim())return;try{const t=await api('/api/tasks',{method:'POST',body:JSON.stringify({prompt:prompt.value.trim()})});prompt.value='';await loadTasks();await openTask(t.id)}catch(e:any){ElMessage.error(formatError(e))}}
+async function openTask(id:string){if(source){source.close();source=null}try{selected.value=await api(`/api/tasks/${id}`);events.value=selected.value?.events||[];source=new EventSource(`/api/tasks/${id}/events?after=${events.value.length}`,{withCredentials:true});source.onmessage=(ev)=>{try{const x=JSON.parse(ev.data);events.value.push(x);if(x.type==='thread.started'&&selected.value){selected.value.codex_session_id=x.data.thread_id||selected.value.codex_session_id}loadTasks()}catch{}};source.addEventListener('end',()=>{source?.close();source=null;loadTasks();openTaskData(id)});source.onerror=()=>{source?.close();source=null;loadTasks()}}catch(e:any){ElMessage.error(formatError(e))}}
 async function openTaskData(id:string){try{selected.value=await api(`/api/tasks/${id}`);events.value=selected.value.events||[]}catch{}}
-async function cancelTask(){if(!selected.value)return;try{await api(`/api/tasks/${selected.value.id}/cancel`,{method:'POST'});ElMessage.success('已请求取消');await loadTasks()}catch(e:any){ElMessage.error(e.message)}}
-async function resumeTask(){if(!selected.value)return;try{const {value}=await ElMessageBox.prompt('输入继续指令','继续 Codex 会话',{inputType:'textarea',inputPlaceholder:'例如：继续完成剩余工作，并运行相关检查'});const t=await api(`/api/tasks/${selected.value.id}/resume`,{method:'POST',body:JSON.stringify({prompt:value})});await loadTasks();await openTask(t.id)}catch(e:any){if(e!=='cancel')ElMessage.error((e as any).message||String(e))}}
-async function addUser(){if(!userForm.value.username.trim())return;try{const x=await api('/api/admin/users',{method:'POST',body:JSON.stringify(userForm.value)});await loadUsers();await ElMessageBox.alert(`临时密码：${x.temporary_password}\n请安全复制给用户；首次登录必须修改。`,'用户已创建',{confirmButtonText:'知道了'}) ;userForm.value={username:'',role:'user'}}catch(e:any){ElMessage.error(e.message)}}
-async function toggleUser(u:User){try{await api(`/api/admin/users/${u.id}?active=${!u.active}&role=${u.role}`,{method:'PATCH'});await loadUsers()}catch(e:any){ElMessage.error(e.message)}}
-async function resetUser(u:User){try{await ElMessageBox.confirm(`重置 ${u.username} 的登录密码？`,'确认');const x=await api(`/api/admin/users/${u.id}/reset-password`,{method:'POST'});await ElMessageBox.alert(`临时密码：${x.temporary_password}\n用户下次登录后必须修改。`,'密码已重置')}catch(e:any){if(e!=='cancel')ElMessage.error((e as any).message||String(e))}}
+async function cancelTask(){if(!selected.value)return;try{await api(`/api/tasks/${selected.value.id}/cancel`,{method:'POST'});ElMessage.success('已请求取消');await loadTasks()}catch(e:any){ElMessage.error(formatError(e))}}
+async function resumeTask(){if(!selected.value)return;try{const {value}=await ElMessageBox.prompt('输入继续指令','继续 Codex 会话',{inputType:'textarea',inputPlaceholder:'例如：继续完成剩余工作，并运行相关检查'});const t=await api(`/api/tasks/${selected.value.id}/resume`,{method:'POST',body:JSON.stringify({prompt:value})});await loadTasks();await openTask(t.id)}catch(e:any){if(e!=='cancel')ElMessage.error(formatError(e))}}
+async function addUser(){if(!userForm.value.username.trim())return;try{const x=await api('/api/admin/users',{method:'POST',body:JSON.stringify(userForm.value)});await loadUsers();await ElMessageBox.alert(`临时密码：${x.temporary_password}\n请安全复制给用户；首次登录必须修改。`,'用户已创建',{confirmButtonText:'知道了'}) ;userForm.value={username:'',role:'user'}}catch(e:any){ElMessage.error(formatError(e))}}
+async function toggleUser(u:User){try{await api(`/api/admin/users/${u.id}?active=${!u.active}&role=${u.role}`,{method:'PATCH'});await loadUsers()}catch(e:any){ElMessage.error(formatError(e))}}
+async function resetUser(u:User){try{await ElMessageBox.confirm(`重置 ${u.username} 的登录密码？`,'确认');const x=await api(`/api/admin/users/${u.id}/reset-password`,{method:'POST'});await ElMessageBox.alert(`临时密码：${x.temporary_password}\n用户下次登录后必须修改。`,'密码已重置')}catch(e:any){if(e!=='cancel')ElMessage.error(formatError(e))}}
 function statusType(s:string){return ({queued:'info',running:'warning',cancel_requested:'warning',succeeded:'success',failed:'danger',cancelled:'info',interrupted:'danger'} as any)[s]||'info'}
 function statusLabel(s:string){return ({queued:'排队中',running:'运行中',cancel_requested:'取消中',succeeded:'已完成',failed:'失败',cancelled:'已取消',interrupted:'已中断'} as any)[s]||s}
 function time(v:string){return v?new Date(v).toLocaleString():'—'}
@@ -56,9 +81,9 @@ onUnmounted(()=>{if(source)source.close();if(refreshTimer)clearInterval(refreshT
 
 <template>
   <div v-if="loading" class="login-wrap"><el-card>正在连接控制台…</el-card></div>
-  <div v-else-if="setupNeeded" class="login-wrap"><div class="login-card"><div class="brand"><span class="brand-mark">C</span> Codex 控制台</div><h1 style="margin-top:24px">首次初始化</h1><p>使用服务器生成的一次性初始化令牌创建管理员。管理员密码至少 12 位。</p><el-form label-position="top"><el-form-item label="初始化令牌"><el-input v-model="setupForm.token" show-password /></el-form-item><el-form-item label="管理员用户名"><el-input v-model="setupForm.username" /></el-form-item><el-form-item label="管理员密码"><el-input v-model="setupForm.password" type="password" show-password /></el-form-item><el-button type="primary" style="width:100%" @click="bootstrap">创建管理员</el-button></el-form></div></div>
+  <div v-else-if="setupNeeded" class="login-wrap"><div class="login-card"><div class="brand"><span class="brand-mark">C</span> Codex 控制台</div><h1 style="margin-top:24px">首次初始化</h1><p>使用服务器生成的一次性初始化令牌创建管理员。管理员密码不能为空。</p><el-form label-position="top"><el-form-item label="初始化令牌"><el-input v-model="setupForm.token" show-password /></el-form-item><el-form-item label="管理员用户名"><el-input v-model="setupForm.username" /></el-form-item><el-form-item label="管理员密码"><el-input v-model="setupForm.password" type="password" show-password /></el-form-item><el-button type="primary" style="width:100%" @click="bootstrap">创建管理员</el-button></el-form></div></div>
   <div v-else-if="!user" class="login-wrap"><div class="login-card"><div class="brand"><span class="brand-mark">C</span> Codex 控制台</div><h1 style="margin-top:24px">登录</h1><p>使用管理员或已创建的用户账号登录。</p><el-form label-position="top" @submit.prevent="login"><el-form-item label="用户名"><el-input v-model="loginForm.username" autocomplete="username" /></el-form-item><el-form-item label="密码"><el-input v-model="loginForm.password" type="password" show-password autocomplete="current-password" @keyup.enter="login" /></el-form-item><el-button type="primary" style="width:100%" @click="login">登录</el-button></el-form></div></div>
-  <div v-else-if="user.password_change_required" class="login-wrap"><div class="login-card"><div class="brand"><span class="brand-mark">C</span> Codex 控制台</div><h1 style="margin-top:24px">设置新密码</h1><p>这是临时密码。请设置至少 12 位的新密码后继续。</p><el-form label-position="top"><el-form-item label="新密码"><el-input v-model="passwordForm.new_password" type="password" show-password /></el-form-item><el-button type="primary" style="width:100%" @click="changePassword">更新密码</el-button></el-form></div></div>
+  <div v-else-if="user.password_change_required" class="login-wrap"><div class="login-card"><div class="brand"><span class="brand-mark">C</span> Codex 控制台</div><h1 style="margin-top:24px">设置新密码</h1><p>请输入新的非空密码后继续。</p><el-form label-position="top"><el-form-item label="新密码"><el-input v-model="passwordForm.new_password" type="password" show-password /></el-form-item><el-button type="primary" style="width:100%" @click="changePassword">更新密码</el-button></el-form></div></div>
   <div v-else class="shell">
     <header class="topbar"><div class="brand"><span class="brand-mark">C</span> Codex 控制台</div><div class="top-actions"><el-tag :type="system.codex?.authenticated?'success':'warning'">{{system.codex?.authenticated?'Codex 已登录':'Codex 未登录'}}</el-tag><span>{{user.username}} · {{user.role==='admin'?'管理员':'用户'}}</span><el-button text @click="logout">退出</el-button></div></header>
     <main class="layout"><div class="tabs"><el-button :type="activeTab==='tasks'?'primary':'default'" @click="activeTab='tasks'">任务</el-button><el-button v-if="isAdmin" :type="activeTab==='users'?'primary':'default'" @click="activeTab='users';loadUsers()">用户管理</el-button></div>

@@ -14,7 +14,8 @@ from typing import Generator
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, create_engine, func, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
@@ -81,6 +82,38 @@ class TaskEvent(Base):
 
 app = FastAPI(title='Codex Console', docs_url=None, redoc_url=None)
 
+VALIDATION_LABELS = {
+    'password': '密码',
+    'new_password': '新密码',
+    'current_password': '当前密码',
+    'token': '初始化令牌',
+    'username': '用户名',
+    'role': '角色',
+    'prompt': '任务描述',
+}
+
+def validation_error_message(exc: RequestValidationError) -> str:
+    messages = []
+    for item in exc.errors():
+        location = item.get('loc') or []
+        field = str(location[-1]) if location else ''
+        label = VALIDATION_LABELS.get(field, field or '请求参数')
+        error_type = item.get('type', '')
+        if error_type in ('missing', 'string_too_short'):
+            message = '不能为空'
+        elif error_type in ('string_too_long', 'too_long'):
+            message = '过长'
+        elif error_type == 'string_pattern_mismatch':
+            message = '格式不正确'
+        else:
+            message = str(item.get('msg') or '参数不合法')
+        messages.append(f'{label}{message}')
+    return '；'.join(messages) or '请求参数不合法'
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=422, content={'detail': validation_error_message(exc)})
+
 def db_dep() -> Generator[Session, None, None]:
     db = SessionLocal()
     try:
@@ -125,7 +158,7 @@ def verify_csrf(request: Request, x_csrf_token: str | None):
 class BootstrapIn(BaseModel):
     token: str
     username: str = Field(min_length=3, max_length=64, pattern=r'^[a-zA-Z0-9_.-]+$')
-    password: str = Field(min_length=12, max_length=200)
+    password: str = Field(min_length=1)
 
 class LoginIn(BaseModel):
     username: str
@@ -133,7 +166,7 @@ class LoginIn(BaseModel):
 
 class PasswordIn(BaseModel):
     current_password: str = ''
-    new_password: str = Field(min_length=12, max_length=200)
+    new_password: str = Field(min_length=1)
 
 class UserCreateIn(BaseModel):
     username: str = Field(min_length=3, max_length=64, pattern=r'^[a-zA-Z0-9_.-]+$')
