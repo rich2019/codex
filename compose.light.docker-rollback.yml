@@ -1,0 +1,134 @@
+services:
+  mysql:
+    image: docker.m.daocloud.io/library/mysql:8.4
+    restart: unless-stopped
+    command: ["--innodb-buffer-pool-size=128M", "--max-connections=15", "--performance-schema=OFF", "--innodb-log-buffer-size=8M", "--character-set-server=utf8mb4", "--collation-server=utf8mb4_0900_ai_ci"]
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-codex_console}
+      MYSQL_USER: ${MYSQL_USER:-codex_app}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+    mem_limit: 480m
+    networks: [backend]
+  api:
+    image: codex-console-backend:f9e7591
+    build:
+      context: ./backend
+    restart: unless-stopped
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-codex_console}
+      MYSQL_USER: ${MYSQL_USER:-codex_app}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      HTTP_PROXY: http://mihomo:7890
+      HTTPS_PROXY: http://mihomo:7890
+      ALL_PROXY: http://mihomo:7890
+      NO_PROXY: localhost,127.0.0.1,::1,mysql,mihomo,status-agent,172.24.53.149,10.0.7.126
+      http_proxy: http://mihomo:7890
+      https_proxy: http://mihomo:7890
+      all_proxy: http://mihomo:7890
+      no_proxy: localhost,127.0.0.1,::1,mysql,mihomo,status-agent,172.24.53.149,10.0.7.126
+      BOOTSTRAP_TOKEN: ${BOOTSTRAP_TOKEN}
+      COOKIE_SECURE: "false"
+      CODEX_STATUS_FILE: /state/codex_status.json
+      CODEX_WORKSPACE: /srv/codex/projects/rich2019-codex
+      CODEX_WORKTREES: /srv/codex/worktrees
+      CODEX_UPLOADS: /srv/codex/uploads
+      CODEX_CRYPTO_KEY_FILE: /home/codex/.codex/console-crypto-key
+      STATUS_AGENT_TOKEN: ${STATUS_AGENT_TOKEN}
+      STATUS_AGENTS: '{"ecs":"http://10.0.7.126:9107","light":"http://172.24.53.149:9107"}'
+    ports:
+      - "172.24.53.149:8000:8000"
+    volumes:
+      - ./state:/state:ro
+      - codex_auth:/home/codex/.codex
+      - /srv/codex:/srv/codex:ro
+      - /srv/codex/uploads:/srv/codex/uploads
+    depends_on:
+      mysql: { condition: service_healthy }
+      mihomo: { condition: service_started }
+    mem_limit: 160m
+    networks: [backend]
+  worker:
+    image: codex-console-backend:f9e7591
+    restart: unless-stopped
+    command: ["python", "worker.py"]
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-codex_console}
+      MYSQL_USER: ${MYSQL_USER:-codex_app}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      HTTP_PROXY: http://mihomo:7890
+      HTTPS_PROXY: http://mihomo:7890
+      ALL_PROXY: http://mihomo:7890
+      NO_PROXY: localhost,127.0.0.1,::1,mysql,mihomo,status-agent,172.24.53.149,10.0.7.126
+      http_proxy: http://mihomo:7890
+      https_proxy: http://mihomo:7890
+      all_proxy: http://mihomo:7890
+      no_proxy: localhost,127.0.0.1,::1,mysql,mihomo,status-agent,172.24.53.149,10.0.7.126
+      CODEX_STATUS_FILE: /state/codex_status.json
+      CODEX_WORKSPACE: /srv/codex/projects/rich2019-codex
+      CODEX_WORKTREES: /srv/codex/worktrees
+      CODEX_UPLOADS: /srv/codex/uploads
+      MAX_TASK_SECONDS: "7200"
+    volumes:
+      - codex_auth:/home/codex/.codex
+      - ./state:/state
+      - /srv/codex:/srv/codex
+    depends_on:
+      mysql: { condition: service_healthy }
+      mihomo: { condition: service_started }
+    mem_limit: 384m
+    networks: [backend]
+  mihomo:
+    build:
+      context: ./mihomo
+      dockerfile: Dockerfile
+    image: codex-console-mihomo:v1.19.31
+    restart: unless-stopped
+    command: ["-d", "/root/.config/mihomo", "-f", "/etc/mihomo/config.yaml"]
+    cap_drop: [ALL]
+    volumes:
+      - ./mihomo/config.yaml:/etc/mihomo/config.yaml:ro
+      - mihomo_data:/root/.config/mihomo
+    expose: ["7890"]
+    mem_limit: 128m
+    networks: [backend]
+  status-agent:
+    image: codex-console-status-agent:67634eb
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.status-agent
+    restart: unless-stopped
+    environment:
+      STATUS_AGENT_TOKEN: ${STATUS_AGENT_TOKEN}
+      STATUS_SERVICES: '{"api":"http://api:8000/api/health","mysql":"tcp://mysql:3306","mihomo":"tcp://mihomo:7890","worker":"file:///state/worker.heartbeat"}'
+    ports:
+      - "172.24.53.149:9107:9107"
+    volumes:
+      - /:/host-root:ro
+      - ./state:/state:ro
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 24m
+    networks: [backend]
+volumes:
+  mysql_data:
+  codex_auth:
+    external: true
+    name: codex-backend_codex_auth
+  mihomo_data:
+    external: true
+    name: codex-backend_mihomo_data
+networks:
+  backend:

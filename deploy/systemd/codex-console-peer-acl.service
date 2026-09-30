@@ -1,0 +1,14 @@
+[Unit]
+Description=Restrict Codex private service ports to the ECS peer
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/codex-console-peer-acl
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

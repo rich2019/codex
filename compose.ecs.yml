@@ -11,25 +11,6 @@ services:
       - acme_webroot:/var/www/certbot:ro
     mem_limit: 48m
     networks: [edge]
-  status-agent:
-    image: codex-console-status-agent:67634eb
-    build:
-      context: ./backend
-      dockerfile: Dockerfile.status-agent
-    restart: unless-stopped
-    environment:
-      STATUS_AGENT_TOKEN: ${STATUS_AGENT_TOKEN}
-      STATUS_SERVICES: '{"frontend":"http://gateway/"}'
-    ports:
-      - "10.0.7.126:9107:9107"
-    volumes:
-      - /:/host-root:ro
-    read_only: true
-    tmpfs: [/tmp]
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
-    mem_limit: 24m
-    networks: [edge]
   certbot:
     image: certbot/certbot:latest
     profiles: [tools]

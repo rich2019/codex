@@ -36,6 +36,7 @@ def write_status():
     os.replace(tmp, CODEX_STATUS_FILE)
     heartbeat = CODEX_STATUS_FILE.parent / 'worker.heartbeat'
     heartbeat.touch()
+    os.chmod(heartbeat, 0o644)
     return status
 
 

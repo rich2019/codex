@@ -1,0 +1,28 @@
+[Unit]
+Description=Codex Console read-only host status agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=codex-monitor
+Group=codex-monitor
+EnvironmentFile=/etc/codex-console/status-agent.env
+ExecStart=/usr/bin/python3 /usr/local/lib/codex-console/status_agent.py
+Restart=on-failure
+RestartSec=3
+MemoryMax=48M
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+PrivateTmp=true
+ReadOnlyPaths=/var/lib/codex-console/state
+
+[Install]
+WantedBy=multi-user.target

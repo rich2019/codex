@@ -1,0 +1,37 @@
+[Unit]
+Description=Codex Console API (host-native)
+After=network-online.target docker.service codex-console-peer-acl.service
+Wants=network-online.target
+Requires=docker.service codex-console-peer-acl.service
+
+[Service]
+Type=simple
+User=codex-console
+Group=codex-console
+WorkingDirectory=/opt/codex-backend/backend
+EnvironmentFile=/etc/codex-console/api.env
+Environment=HOME=/home/codex-console
+Environment=PATH=/opt/codex-runtime/codex-cli/bin:/opt/codex-runtime/node-v22.23.3/bin:/opt/codex-console/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/usr/local/sbin/codex-console-wait-infra
+ExecStart=/opt/codex-backend/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips=*
+Restart=on-failure
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=20
+MemoryMax=160M
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+PrivateTmp=true
+ReadOnlyPaths=/srv/codex/projects/rich2019-codex /srv/codex/worktrees /var/lib/codex-console/state
+ReadWritePaths=/home/codex-console /srv/codex/uploads
+
+[Install]
+WantedBy=multi-user.target

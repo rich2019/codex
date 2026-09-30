@@ -10,6 +10,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TOKEN = os.environ['STATUS_AGENT_TOKEN']
 SERVICES = json.loads(os.getenv('STATUS_SERVICES', '{}'))
+HOST_ROOT = os.getenv('STATUS_HOST_ROOT', '/host-root')
+BIND_ADDRESS = os.getenv('STATUS_BIND_ADDRESS', '0.0.0.0')
+PORT = int(os.getenv('PORT', '9107'))
+internal_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def cpu_counters():
@@ -53,14 +57,14 @@ def collect():
                 stamp = Path(url.removeprefix('file://')).stat().st_mtime
                 services[name] = {'healthy': time.time() - stamp < 60}
             else:
-                with urllib.request.urlopen(url, timeout=2) as response:
+                with internal_opener.open(url, timeout=2) as response:
                     services[name] = {'healthy': 200 <= response.status < 300}
         except Exception:
             services[name] = {'healthy': False}
     load = os.getloadavg()
     with open('/proc/uptime', encoding='ascii') as handle:
         uptime = int(float(handle.read().split()[0]))
-    disk = os.statvfs('/host-root')
+    disk = os.statvfs(HOST_ROOT)
     disk_total = disk.f_blocks * disk.f_frsize
     disk_free = disk.f_bavail * disk.f_frsize
     return {
@@ -99,4 +103,4 @@ class Handler(BaseHTTPRequestHandler):
         return
 
 
-ThreadingHTTPServer(('0.0.0.0', int(os.getenv('PORT', '9107'))), Handler).serve_forever()
+ThreadingHTTPServer((BIND_ADDRESS, PORT), Handler).serve_forever()

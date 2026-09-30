@@ -1,0 +1,36 @@
+[Unit]
+Description=Codex Console task worker (host-native)
+After=network-online.target docker.service codex-console-peer-acl.service
+Wants=network-online.target
+Requires=docker.service codex-console-peer-acl.service
+
+[Service]
+Type=simple
+User=codex-console
+Group=codex-console
+WorkingDirectory=/opt/codex-backend/backend
+EnvironmentFile=/etc/codex-console/worker.env
+Environment=HOME=/home/codex-console
+Environment=PATH=/opt/codex-runtime/codex-cli/bin:/opt/codex-runtime/node-v22.23.3/bin:/opt/codex-console/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/usr/local/sbin/codex-console-wait-infra
+ExecStart=/opt/codex-backend/venv/bin/python /opt/codex-backend/backend/worker.py
+Restart=on-failure
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=30
+MemoryMax=384M
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+PrivateTmp=true
+ReadWritePaths=/home/codex-console /srv/codex/projects/rich2019-codex /srv/codex/worktrees /srv/codex/uploads /var/lib/codex-console/state
+
+[Install]
+WantedBy=multi-user.target
