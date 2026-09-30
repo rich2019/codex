@@ -1,4 +1,4 @@
-FROM node:22-bookworm-slim
+FROM docker.m.daocloud.io/library/node:22-bookworm-slim
 RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources && npm config set registry https://registry.npmmirror.com && apt-get update && apt-get install -y --no-install-recommends python3 passwd python3-venv python3-pip git ca-certificates tini && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:/usr/local/bin:/usr/bin:/bin" PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
