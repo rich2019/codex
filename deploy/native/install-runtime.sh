@@ -40,7 +40,7 @@ if [[ ! -x "$PYTHON_PREFIX/bin/python3.11" ]] || [[ "$("$PYTHON_PREFIX/bin/pytho
     (
         cd "$temp_dir/Python-$PYTHON_VERSION"
         ./configure --prefix="$PYTHON_PREFIX" --with-ensurepip=install
-        make -j2
+        make -j1
         make altinstall
     )
 fi
@@ -76,3 +76,4 @@ chmod -R a+rX "$RUNTIME_ROOT" "$APP_ROOT/venv"
 "$NODE_PREFIX/bin/node" --version
 "$CODEX_PREFIX/bin/codex" --version
 "$APP_ROOT/venv/bin/python" --version
+
