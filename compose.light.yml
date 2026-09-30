@@ -18,6 +18,7 @@ services:
     mem_limit: 480m
     networks: [backend]
   api:
+    image: codex-console-backend:67634eb
     build:
       context: ./backend
     restart: unless-stopped
@@ -57,8 +58,7 @@ services:
     mem_limit: 160m
     networks: [backend]
   worker:
-    build:
-      context: ./backend
+    image: codex-console-backend:67634eb
     restart: unless-stopped
     command: ["python", "worker.py"]
     environment:
@@ -103,6 +103,7 @@ services:
     mem_limit: 128m
     networks: [backend]
   status-agent:
+    image: codex-console-status-agent:67634eb
     build:
       context: ./backend
       dockerfile: Dockerfile.status-agent

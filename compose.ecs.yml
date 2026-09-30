@@ -11,6 +11,7 @@ services:
     mem_limit: 48m
     networks: [edge]
   status-agent:
+    image: codex-console-status-agent:67634eb
     build:
       context: ./backend
       dockerfile: Dockerfile.status-agent
