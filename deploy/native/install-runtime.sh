@@ -24,8 +24,8 @@ temp_dir="$(mktemp -d /var/tmp/codex-runtime.XXXXXX)"
 trap 'rm -rf "$temp_dir"' EXIT
 install -d -m 0755 "$RUNTIME_ROOT"
 
-apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+apt_proxy_args=(-o "Acquire::http::Proxy=$HTTP_PROXY" -o "Acquire::https::Proxy=$HTTPS_PROXY")\napt-get "${apt_proxy_args[@]}" update
+DEBIAN_FRONTEND=noninteractive apt-get "${apt_proxy_args[@]}" install -y --no-install-recommends \
     build-essential ca-certificates curl git xz-utils pkg-config \
     libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev \
     libffi-dev liblzma-dev libncursesw5-dev libgdbm-dev uuid-dev
