@@ -11,7 +11,7 @@ Group=codex-console
 WorkingDirectory=/opt/codex-backend/backend
 EnvironmentFile=/etc/codex-console/worker.env
 Environment=HOME=/home/codex-console
-Environment=PATH=/opt/codex-runtime/codex-cli/bin:/opt/codex-runtime/node-v22.23.3/bin:/opt/codex-console/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+Environment=PATH=/opt/codex-runtime/codex-cli/bin:/opt/codex-runtime/node-v22.23.3/bin:/opt/codex-backend/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
 ExecStartPre=/usr/local/sbin/codex-console-wait-infra
