@@ -125,6 +125,10 @@ services:
 volumes:
   mysql_data:
   codex_auth:
+    external: true
+    name: codex-backend_codex_auth
   mihomo_data:
+    external: true
+    name: codex-backend_mihomo_data
 networks:
   backend:
