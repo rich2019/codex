@@ -1,0 +1,60 @@
+mixed-port: 7890
+allow-lan: true
+bind-address: 0.0.0.0
+mode: rule
+log-level: info
+ipv6: false
+
+external-controller: 0.0.0.0:9090
+secret: "REPLACE_WITH_RANDOM_SECRET"
+
+proxy-providers:
+  us_la02_primary:
+    type: http
+    url: "REPLACE_WITH_SERVER_ONLY_SUBSCRIPTION_URL"
+    path: ./providers/us-la02-primary.yaml
+    interval: 3600
+    proxy: Codex-US-LA02
+    filter: '(?i)^🇺🇸美国洛杉矶02\|流媒体\|0\.01x$'
+    health-check:
+      enable: true
+      url: https://www.gstatic.com/generate_204
+      interval: 60
+      timeout: 5000
+      lazy: false
+      expected-status: 204
+  us_backup:
+    type: http
+    url: "REPLACE_WITH_SERVER_ONLY_SUBSCRIPTION_URL"
+    path: ./providers/us-backup.yaml
+    interval: 3600
+    proxy: Codex-US-LA02
+    filter: '(?i)(美国|🇺🇸|United States)'
+    exclude-filter: '(?i)洛杉矶02'
+    health-check:
+      enable: true
+      url: https://www.gstatic.com/generate_204
+      interval: 60
+      timeout: 5000
+      lazy: false
+      expected-status: 204
+
+proxy-groups:
+  - name: Codex-US-LA02
+    type: fallback
+    use:
+      - us_la02_primary
+      - us_backup
+    lazy: false
+    empty-fallback: REJECT
+
+rules:
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,169.254.0.0/16,DIRECT,no-resolve
+  - IP-CIDR6,fc00::/7,DIRECT,no-resolve
+  - IP-CIDR6,fe80::/10,DIRECT,no-resolve
+  - IP-CIDR6,::1/128,DIRECT,no-resolve
+  - MATCH,Codex-US-LA02

@@ -7,6 +7,7 @@ import subprocess
 import threading
 import secrets
 import time
+import tomllib
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,7 +21,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from nacl.exceptions import CryptoError
 from nacl.public import Box, PrivateKey, PublicKey
 from pydantic import BaseModel, Field
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, create_engine, func, select
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, create_engine, func, inspect, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 MYSQL_HOST = os.getenv('MYSQL_HOST', 'mysql')
@@ -32,6 +33,8 @@ COOKIE_NAME = 'cc_session'
 COOKIE_SECURE = os.getenv('COOKIE_SECURE', 'true').lower() == 'true'
 BOOTSTRAP_TOKEN = os.getenv('BOOTSTRAP_TOKEN', '')
 CODEX_STATUS_FILE = Path(os.getenv('CODEX_STATUS_FILE', '/state/codex_status.json'))
+CODEX_BIN = os.getenv('CODEX_BIN', '/usr/local/bin/codex')
+CODEX_HOME = Path(os.getenv('CODEX_HOME', '/home/codex/.codex'))
 WORKSPACE = Path(os.getenv('CODEX_WORKSPACE', '/srv/codex/repo'))
 WORKTREES = Path(os.getenv('CODEX_WORKTREES', '/srv/codex/worktrees'))
 CRYPTO_KEY_FILE = Path(os.getenv('CODEX_CRYPTO_KEY_FILE', '/home/codex/.codex/console-crypto-key'))
@@ -65,6 +68,8 @@ class Task(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey('users.id'), index=True)
     prompt: Mapped[str] = mapped_column(Text)
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    reasoning_effort: Mapped[str | None] = mapped_column(String(16), nullable=True)
     status: Mapped[str] = mapped_column(String(24), default='queued', index=True)
     codex_session_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
     resume_requested: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -85,6 +90,11 @@ class TaskEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 app = FastAPI(title='Codex Console', docs_url=None, redoc_url=None)
+
+MODEL_CATALOG_TTL = 300
+model_catalog_lock = threading.Lock()
+model_catalog_cache: dict | None = None
+model_catalog_cached_at = 0.0
 
 VALIDATION_LABELS = {
     'password': '密码',
@@ -220,7 +230,7 @@ def user_json(u: User) -> dict:
     return {'id': u.id, 'username': u.username, 'role': u.role, 'active': u.active, 'password_change_required': u.password_change_required, 'created_at': u.created_at.isoformat() + 'Z'}
 
 def task_json(t: Task) -> dict:
-    return {'id': t.id, 'user_id': t.user_id, 'prompt': t.prompt, 'status': t.status, 'codex_session_id': t.codex_session_id, 'final_output': t.final_output, 'error': t.error, 'created_at': t.created_at.isoformat() + 'Z', 'updated_at': t.updated_at.isoformat() + 'Z'}
+    return {'id': t.id, 'user_id': t.user_id, 'prompt': t.prompt, 'model': t.model, 'reasoning_effort': t.reasoning_effort, 'status': t.status, 'codex_session_id': t.codex_session_id, 'final_output': t.final_output, 'error': t.error, 'created_at': t.created_at.isoformat() + 'Z', 'updated_at': t.updated_at.isoformat() + 'Z'}
 
 def current_user(request: Request, db: Session = Depends(db_dep)) -> User:
     raw = request.cookies.get(COOKIE_NAME)
@@ -274,26 +284,144 @@ class UserCreateIn(BaseModel):
 
 class TaskIn(BaseModel):
     prompt: str = Field(min_length=1, max_length=20000)
+    model: str | None = Field(default=None, min_length=1, max_length=128)
+    reasoning_effort: str | None = Field(default=None, min_length=1, max_length=16)
+
+
+def ensure_task_settings_columns(db_engine=engine):
+    """Add nullable task settings to existing MySQL databases, safely across API/worker startup."""
+    lock_name = 'codex_console_task_settings_migration'
+    with db_engine.connect() as connection:
+        locked = False
+        try:
+            if connection.dialect.name == 'mysql':
+                locked = connection.execute(
+                    text('SELECT GET_LOCK(:name, 30)'), {'name': lock_name}
+                ).scalar() == 1
+                if not locked:
+                    raise RuntimeError('Timed out waiting for task schema migration lock')
+            columns = {column['name'] for column in inspect(connection).get_columns('tasks')}
+            if 'model' not in columns:
+                connection.execute(text('ALTER TABLE tasks ADD COLUMN model VARCHAR(128) NULL'))
+            if 'reasoning_effort' not in columns:
+                connection.execute(text('ALTER TABLE tasks ADD COLUMN reasoning_effort VARCHAR(16) NULL'))
+            connection.commit()
+        finally:
+            if locked:
+                connection.execute(text('SELECT RELEASE_LOCK(:name)'), {'name': lock_name})
+                connection.commit()
+
+
+def _configured_codex_model() -> str | None:
+    config_path = CODEX_HOME / 'config.toml'
+    try:
+        config = tomllib.loads(config_path.read_text(encoding='utf-8'))
+        model = config.get('model')
+        return model if isinstance(model, str) and model else None
+    except Exception:
+        return None
+
+
+def get_codex_model_catalog() -> dict:
+    """Return a safe, minimal view of models advertised by the installed Codex CLI."""
+    global model_catalog_cache, model_catalog_cached_at
+    now = time.monotonic()
+    with model_catalog_lock:
+        if model_catalog_cache and now - model_catalog_cached_at < MODEL_CATALOG_TTL:
+            return dict(model_catalog_cache)
+
+        raw_catalog = None
+        catalog_error = ''
+        for args in ([CODEX_BIN, 'debug', 'models'], [CODEX_BIN, 'debug', 'models', '--bundled']):
+            try:
+                result = subprocess.run(args, capture_output=True, text=True, timeout=20, env=os.environ)
+                if result.returncode == 0:
+                    candidate = json.loads(result.stdout)
+                    if isinstance(candidate, dict) and isinstance(candidate.get('models'), list):
+                        raw_catalog = candidate
+                        break
+                catalog_error = 'Codex 模型目录不可用'
+            except Exception:
+                catalog_error = 'Codex 模型目录不可用'
+
+        if raw_catalog is None:
+            if model_catalog_cache:
+                stale = dict(model_catalog_cache)
+                stale['stale'] = True
+                return stale
+            return {'available': False, 'default_model': None, 'models': [], 'message': catalog_error or 'Codex 模型目录不可用'}
+
+        models = []
+        for entry in raw_catalog['models']:
+            if not isinstance(entry, dict) or entry.get('visibility') != 'list' or entry.get('supported_in_api') is not True:
+                continue
+            model_id = entry.get('slug')
+            if not isinstance(model_id, str) or not model_id:
+                continue
+            levels = entry.get('supported_reasoning_levels') or []
+            efforts = []
+            for level in levels:
+                effort = level.get('effort') if isinstance(level, dict) else level
+                if isinstance(effort, str) and effort not in efforts:
+                    efforts.append(effort)
+            models.append({
+                'id': model_id,
+                'name': str(entry.get('display_name') or model_id),
+                'default_effort': entry.get('default_reasoning_level') if isinstance(entry.get('default_reasoning_level'), str) else None,
+                'reasoning_efforts': efforts,
+            })
+
+        configured_default = _configured_codex_model()
+        model_ids = {entry['id'] for entry in models}
+        catalog = {
+            'available': True,
+            'default_model': configured_default if configured_default in model_ids else None,
+            'models': models,
+            'stale': False,
+        }
+        model_catalog_cache = catalog
+        model_catalog_cached_at = time.monotonic()
+        return dict(catalog)
+
+
+def validate_task_settings(model: str | None, reasoning_effort: str | None):
+    if model is None and reasoning_effort is None:
+        return
+    catalog = get_codex_model_catalog()
+    if not catalog.get('available'):
+        raise HTTPException(503, 'Codex 模型目录暂不可用，请使用 Codex 默认设置后重试')
+    selected_id = model or catalog.get('default_model')
+    selected = next((item for item in catalog['models'] if item['id'] == selected_id), None)
+    if model is not None and selected is None:
+        raise HTTPException(422, '所选模型不在当前 Codex 模型目录中')
+    if reasoning_effort is not None:
+        if selected is None:
+            raise HTTPException(422, '请先选择具体模型，再设置推理强度')
+        if reasoning_effort not in selected['reasoning_efforts']:
+            raise HTTPException(422, '该模型不支持所选推理强度')
 
 failed_logins: dict[str, list[float]] = {}
 login_lock = threading.Lock()
 login_proc = None
 login_state = {'running': False, 'authenticated': False, 'device_url': '', 'user_code': '', 'message': ''}
+ANSI_ESCAPE_RE = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
+DEVICE_CODE_RE = re.compile(r'(?<![A-Z0-9])([A-Z0-9]{4,8})\s*-\s*([A-Z0-9]{4,8})(?![A-Z0-9])', re.IGNORECASE)
 
 def _device_login_reader(proc):
     global login_state, login_proc
     try:
         for line in proc.stdout:
-            text = line.strip()
+            text = ANSI_ESCAPE_RE.sub('', line).replace('\r', '').strip()
             url = re.search(r'https?://[^\s]+', text)
-            code = re.search(r'\b[A-Z0-9]{4,8}-[A-Z0-9]{4,8}\b', text)
+            code = DEVICE_CODE_RE.search(text)
             with login_lock:
                 if url:
                     login_state['device_url'] = url.group(0).rstrip('.,')
                 if code:
-                    login_state['user_code'] = code.group(0)
-                if 'code' in text.lower() or 'visit' in text.lower():
-                    login_state['message'] = text[:240]
+                    login_state['user_code'] = f'{code.group(1).upper()}-{code.group(2).upper()}'
+                    login_state['message'] = '请在授权页面输入上方代码'
+                elif url:
+                    login_state['message'] = '正在等待账号授权'
         rc = proc.wait()
         with login_lock:
             login_state['running'] = False
@@ -310,6 +438,7 @@ def startup():
     for _ in range(30):
         try:
             Base.metadata.create_all(engine)
+            ensure_task_settings_columns()
             crypto_key()
             return
         except Exception:
@@ -513,15 +642,20 @@ def codex_status() -> dict:
 def system_status(u: User = Depends(require_ready_user)):
     return {'codex': codex_status(), 'workspace_git': (WORKSPACE / '.git').exists(), 'workspace': str(WORKSPACE)}
 
+@app.get('/api/codex/models')
+def codex_models(u: User = Depends(require_ready_user)):
+    return get_codex_model_catalog()
+
 @app.post('/api/tasks')
 def create_task(data: TaskIn, request: Request, x_csrf_token: str | None = Header(default=None), db: Session = Depends(db_dep), u: User = Depends(require_ready_user)):
     verify_csrf(request, x_csrf_token)
+    validate_task_settings(data.model, data.reasoning_effort)
     if not (WORKSPACE / '.git').exists():
         raise HTTPException(409, '尚未配置 Git 工作区，请先将目标仓库放到服务器工作区')
     status = codex_status()
     if not status.get('authenticated'):
         raise HTTPException(503, status.get('message', '请先在服务器完成 Codex ChatGPT 登录'))
-    t = Task(id=str(uuid.uuid4()), user_id=u.id, prompt=data.prompt.strip())
+    t = Task(id=str(uuid.uuid4()), user_id=u.id, prompt=data.prompt.strip(), model=data.model, reasoning_effort=data.reasoning_effort)
     db.add(t)
     db.commit()
     return task_json(t)
@@ -589,7 +723,10 @@ def resume_task(task_id: str, data: TaskIn, request: Request, x_csrf_token: str 
     task_allowed(old, u)
     if old.status not in ('succeeded', 'failed', 'interrupted', 'cancelled') or not old.codex_session_id:
         raise HTTPException(409, '该任务没有可继续的 Codex 会话')
-    t = Task(id=str(uuid.uuid4()), user_id=u.id, prompt=data.prompt.strip(), codex_session_id=old.codex_session_id, resume_requested=True, worktree_path=old.worktree_path)
+    model = data.model if 'model' in data.model_fields_set else old.model
+    reasoning_effort = data.reasoning_effort if 'reasoning_effort' in data.model_fields_set else old.reasoning_effort
+    validate_task_settings(model, reasoning_effort)
+    t = Task(id=str(uuid.uuid4()), user_id=u.id, prompt=data.prompt.strip(), model=model, reasoning_effort=reasoning_effort, codex_session_id=old.codex_session_id, resume_requested=True, worktree_path=old.worktree_path)
     db.add(t)
     db.commit()
     return task_json(t)

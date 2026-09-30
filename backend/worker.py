@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from sqlalchemy import select, func
-from main import SessionLocal, Task, TaskEvent, WORKSPACE, WORKTREES, CODEX_STATUS_FILE, Base, engine
+from main import SessionLocal, Task, TaskEvent, WORKSPACE, WORKTREES, CODEX_STATUS_FILE, Base, engine, ensure_task_settings_columns
 
 CODEX_BIN = os.getenv('CODEX_BIN', '/usr/local/bin/codex')
 MAX_RUNTIME = int(os.getenv('MAX_TASK_SECONDS', '7200'))
@@ -107,16 +107,25 @@ def parse_line(task_id, raw):
     add_event(task_id, item.get('type', 'event'), item)
 
 
+def task_command(task):
+    command = [CODEX_BIN, 'exec']
+    if task.resume_requested and task.codex_session_id:
+        command.extend(['resume', task.codex_session_id])
+    if task.model:
+        command.extend(['--model', task.model])
+    if task.reasoning_effort:
+        command.extend(['--config', f'model_reasoning_effort="{task.reasoning_effort}"'])
+    command.extend(['--json', '--sandbox', 'workspace-write', task.prompt])
+    return command
+
+
 def run_task(task):
     add_event(task.id, 'worker.started', {'task_id': task.id})
     started = time.time()
     proc = None
     try:
         path = prepare_worktree(task)
-        if task.resume_requested and task.codex_session_id:
-            command = [CODEX_BIN, 'exec', 'resume', task.codex_session_id, '--json', '--sandbox', 'workspace-write', task.prompt]
-        else:
-            command = [CODEX_BIN, 'exec', '--json', '--sandbox', 'workspace-write', task.prompt]
+        command = task_command(task)
         env = os.environ.copy()
         env['HOME'] = '/home/codex'
         env['CODEX_HOME'] = '/home/codex/.codex'
@@ -183,6 +192,7 @@ def run_task(task):
 
 def main():
     Base.metadata.create_all(engine)
+    ensure_task_settings_columns()
     with SessionLocal() as db:
         running = db.scalars(select(Task).where(Task.status.in_(['running', 'cancel_requested']))).all()
         for t in running:

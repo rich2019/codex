@@ -10,3 +10,7 @@ frontend/dist/
 work/
 certbot/
 letsencrypt/
+mihomo/config.yaml
+mihomo/mihomo
+mihomo/ca-certificates.crt
+mihomo/*.gz

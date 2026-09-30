@@ -27,6 +27,14 @@ services:
       MYSQL_DATABASE: ${MYSQL_DATABASE:-codex_console}
       MYSQL_USER: ${MYSQL_USER:-codex_app}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      HTTP_PROXY: http://mihomo:7890
+      HTTPS_PROXY: http://mihomo:7890
+      ALL_PROXY: http://mihomo:7890
+      NO_PROXY: localhost,127.0.0.1,::1,mysql,mihomo
+      http_proxy: http://mihomo:7890
+      https_proxy: http://mihomo:7890
+      all_proxy: http://mihomo:7890
+      no_proxy: localhost,127.0.0.1,::1,mysql,mihomo
       BOOTSTRAP_TOKEN: ${BOOTSTRAP_TOKEN}
       COOKIE_SECURE: "false"
       CODEX_STATUS_FILE: /state/codex_status.json
@@ -51,6 +59,14 @@ services:
       MYSQL_DATABASE: ${MYSQL_DATABASE:-codex_console}
       MYSQL_USER: ${MYSQL_USER:-codex_app}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      HTTP_PROXY: http://mihomo:7890
+      HTTPS_PROXY: http://mihomo:7890
+      ALL_PROXY: http://mihomo:7890
+      NO_PROXY: localhost,127.0.0.1,::1,mysql,mihomo
+      http_proxy: http://mihomo:7890
+      https_proxy: http://mihomo:7890
+      all_proxy: http://mihomo:7890
+      no_proxy: localhost,127.0.0.1,::1,mysql,mihomo
       CODEX_STATUS_FILE: /state/codex_status.json
       CODEX_WORKSPACE: /srv/codex/repo
       CODEX_WORKTREES: /srv/codex/worktrees
@@ -62,6 +78,20 @@ services:
     depends_on:
       mysql: { condition: service_healthy }
     mem_limit: 384m
+    networks: [backend]
+  mihomo:
+    build:
+      context: ./mihomo
+      dockerfile: Dockerfile
+    image: codex-console-mihomo:v1.19.31
+    restart: unless-stopped
+    command: ["-d", "/root/.config/mihomo", "-f", "/etc/mihomo/config.yaml"]
+    cap_drop: [ALL]
+    volumes:
+      - ./mihomo/config.yaml:/etc/mihomo/config.yaml:ro
+      - mihomo_data:/root/.config/mihomo
+    expose: ["7890"]
+    mem_limit: 128m
     networks: [backend]
   gateway:
     build:
@@ -86,5 +116,6 @@ volumes:
   codex_auth:
   letsencrypt:
   acme_webroot:
+  mihomo_data:
 networks:
   backend:
