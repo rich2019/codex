@@ -2,14 +2,15 @@ import json
 import os
 import selectors
 import signal
+import shutil
 import subprocess
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import select, func
-from main import SessionLocal, Task, TaskEvent, WORKSPACE, WORKTREES, CODEX_STATUS_FILE, Base, engine, ensure_task_settings_columns
+from main import SessionLocal, Task, TaskEvent, Upload, TaskAttachment, WORKSPACE, WORKTREES, UPLOAD_ROOT, CODEX_STATUS_FILE, Base, engine, ensure_task_settings_columns
 
 CODEX_BIN = os.getenv('CODEX_BIN', '/usr/local/bin/codex')
 MAX_RUNTIME = int(os.getenv('MAX_TASK_SECONDS', '7200'))
@@ -33,6 +34,8 @@ def write_status():
     tmp = CODEX_STATUS_FILE.with_suffix('.tmp')
     tmp.write_text(json.dumps(status, ensure_ascii=False))
     os.replace(tmp, CODEX_STATUS_FILE)
+    heartbeat = CODEX_STATUS_FILE.parent / 'worker.heartbeat'
+    heartbeat.touch()
     return status
 
 
@@ -61,6 +64,7 @@ def prepare_worktree(task):
     if task.worktree_path:
         path = Path(task.worktree_path)
         if path.exists() and (path / '.git').exists():
+            materialize_attachments(task.id, path)
             return path
     base = WORKSPACE.resolve()
     if not (base / '.git').exists():
@@ -75,7 +79,31 @@ def prepare_worktree(task):
     if p.returncode:
         raise RuntimeError((p.stderr or p.stdout)[-2000:])
     update_task(task.id, worktree_path=str(path))
+    materialize_attachments(task.id, path)
     return path
+
+
+def materialize_attachments(task_id, worktree):
+    with SessionLocal() as db:
+        rows = db.execute(select(TaskAttachment, Upload).join(Upload, TaskAttachment.upload_id == Upload.id).where(TaskAttachment.task_id == task_id)).all()
+    if not rows:
+        return
+    attachment_dir = (worktree / 'attachments').resolve()
+    if worktree.resolve() not in attachment_dir.parents or (worktree / 'attachments').is_symlink():
+        raise RuntimeError('非法附件目录')
+    attachment_dir.mkdir(parents=True, exist_ok=True)
+    for attachment, upload in rows:
+        source = UPLOAD_ROOT / str(upload.user_id) / upload.stored_name
+        if not source.is_file() or source.is_symlink():
+            raise RuntimeError(f'附件暂存文件不存在: {upload.original_name}')
+        clean = Path(attachment.original_name.replace('\\', '/')).name
+        clean = ''.join(ch for ch in clean if ch.isprintable() and ch not in '/\\').strip(' .')[:150] or 'file'
+        target = attachment_dir / f'{upload.id[:8]}-{clean}'
+        if target.is_symlink():
+            raise RuntimeError('附件目标路径不能是符号链接')
+        if not target.exists():
+            shutil.copyfile(source, target)
+        source.unlink(missing_ok=True)
 
 
 def collect_diff(path):
@@ -115,8 +143,30 @@ def task_command(task):
         command.extend(['--model', task.model])
     if task.reasoning_effort:
         command.extend(['--config', f'model_reasoning_effort="{task.reasoning_effort}"'])
-    command.extend(['--json', '--sandbox', 'workspace-write', task.prompt])
+    prompt = task.prompt
+    with SessionLocal() as db:
+        attached = db.execute(select(TaskAttachment, Upload).join(Upload, TaskAttachment.upload_id == Upload.id).where(TaskAttachment.task_id == task.id)).all()
+        snapshot_event = db.scalar(select(TaskEvent).where(TaskEvent.task_id == task.id, TaskEvent.event_type == 'diagnostics.snapshot').order_by(TaskEvent.seq.desc()).limit(1))
+    if attached:
+        names = []
+        for attachment, upload in attached:
+            clean = Path(attachment.original_name.replace(chr(92), '/')).name
+            names.append(f"attachments/{upload.id[:8]}-{clean}")
+        prompt += '\n\n用户附加的文件位于工作区下的 attachments/ 目录，可读取并按要求修改：' + '、'.join(names)
+    if snapshot_event:
+        prompt += '\n\n管理员请求附加的服务器只读状态快照：\n' + json.dumps(json.loads(snapshot_event.payload).get('data', {}), ensure_ascii=False)
+    command.extend(['--json', '--sandbox', 'workspace-write', prompt])
     return command
+
+
+def cleanup_staged_uploads():
+    cutoff = datetime.utcnow() - timedelta(days=30)
+    with SessionLocal() as db:
+        rows = db.scalars(select(Upload).where(Upload.attached_task_id.is_(None), Upload.created_at < cutoff)).all()
+        for row in rows:
+            (UPLOAD_ROOT / str(row.user_id) / row.stored_name).unlink(missing_ok=True)
+            db.delete(row)
+        db.commit()
 
 
 def run_task(task):
@@ -200,10 +250,14 @@ def main():
             t.error = 'Worker restarted while task was running'
         db.commit()
     last_check = 0
+    last_upload_cleanup = 0
     while True:
         if time.time() - last_check > 30:
             write_status()
             last_check = time.time()
+        if time.time() - last_upload_cleanup > 3600:
+            cleanup_staged_uploads()
+            last_upload_cleanup = time.time()
         selected = None
         with SessionLocal() as db:
             t = db.scalar(select(Task).where(Task.status == 'queued').order_by(Task.created_at).limit(1).with_for_update(skip_locked=True))

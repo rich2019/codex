@@ -30,11 +30,11 @@ services:
       HTTP_PROXY: http://mihomo:7890
       HTTPS_PROXY: http://mihomo:7890
       ALL_PROXY: http://mihomo:7890
-      NO_PROXY: localhost,127.0.0.1,::1,mysql,mihomo
+      NO_PROXY: localhost,127.0.0.1,::1,mysql,mihomo,status-agent,172.24.53.149,10.0.7.126
       http_proxy: http://mihomo:7890
       https_proxy: http://mihomo:7890
       all_proxy: http://mihomo:7890
-      no_proxy: localhost,127.0.0.1,::1,mysql,mihomo
+      no_proxy: localhost,127.0.0.1,::1,mysql,mihomo,status-agent,172.24.53.149,10.0.7.126
       BOOTSTRAP_TOKEN: ${BOOTSTRAP_TOKEN}
       COOKIE_SECURE: "false"
       CODEX_STATUS_FILE: /state/codex_status.json
@@ -42,6 +42,10 @@ services:
       CODEX_WORKTREES: /srv/codex/worktrees
       CODEX_UPLOADS: /srv/codex/uploads
       CODEX_CRYPTO_KEY_FILE: /home/codex/.codex/console-crypto-key
+      STATUS_AGENT_TOKEN: ${STATUS_AGENT_TOKEN}
+      STATUS_AGENTS: '{"ecs":"http://10.0.7.126:9107","light":"http://172.24.53.149:9107"}'
+    ports:
+      - "172.24.53.149:8000:8000"
     volumes:
       - ./state:/state:ro
       - codex_auth:/home/codex/.codex
@@ -49,6 +53,7 @@ services:
       - /srv/codex/uploads:/srv/codex/uploads
     depends_on:
       mysql: { condition: service_healthy }
+      mihomo: { condition: service_started }
     mem_limit: 160m
     networks: [backend]
   worker:
@@ -64,11 +69,11 @@ services:
       HTTP_PROXY: http://mihomo:7890
       HTTPS_PROXY: http://mihomo:7890
       ALL_PROXY: http://mihomo:7890
-      NO_PROXY: localhost,127.0.0.1,::1,mysql,mihomo
+      NO_PROXY: localhost,127.0.0.1,::1,mysql,mihomo,status-agent,172.24.53.149,10.0.7.126
       http_proxy: http://mihomo:7890
       https_proxy: http://mihomo:7890
       all_proxy: http://mihomo:7890
-      no_proxy: localhost,127.0.0.1,::1,mysql,mihomo
+      no_proxy: localhost,127.0.0.1,::1,mysql,mihomo,status-agent,172.24.53.149,10.0.7.126
       CODEX_STATUS_FILE: /state/codex_status.json
       CODEX_WORKSPACE: /srv/codex/repo
       CODEX_WORKTREES: /srv/codex/worktrees
@@ -80,6 +85,7 @@ services:
       - /srv/codex:/srv/codex
     depends_on:
       mysql: { condition: service_healthy }
+      mihomo: { condition: service_started }
     mem_limit: 384m
     networks: [backend]
   mihomo:
@@ -96,29 +102,28 @@ services:
     expose: ["7890"]
     mem_limit: 128m
     networks: [backend]
-  gateway:
+  status-agent:
     build:
-      context: ./frontend
+      context: ./backend
+      dockerfile: Dockerfile.status-agent
     restart: unless-stopped
+    environment:
+      STATUS_AGENT_TOKEN: ${STATUS_AGENT_TOKEN}
+      STATUS_SERVICES: '{"api":"http://api:8000/api/health","mysql":"tcp://mysql:3306","mihomo":"tcp://mihomo:7890","worker":"file:///state/worker.heartbeat"}'
     ports:
-      - "9999:80"
+      - "172.24.53.149:9107:9107"
     volumes:
-      - ./nginx/http.conf:/etc/nginx/conf.d/default.conf:ro
-      - acme_webroot:/var/www/certbot:ro
-    depends_on: [api]
-    mem_limit: 48m
+      - /:/host-root:ro
+      - ./state:/state:ro
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 24m
     networks: [backend]
-  certbot:
-    image: certbot/certbot:latest
-    profiles: [tools]
-    volumes:
-      - letsencrypt:/etc/letsencrypt
-      - acme_webroot:/var/www/certbot
 volumes:
   mysql_data:
   codex_auth:
-  letsencrypt:
-  acme_webroot:
   mihomo_data:
 networks:
   backend:

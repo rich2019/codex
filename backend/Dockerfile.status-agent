@@ -1,0 +1,6 @@
+FROM python:3.12-slim
+WORKDIR /app
+COPY status_agent.py ./
+USER 65534:65534
+EXPOSE 9107
+CMD ["python", "status_agent.py"]

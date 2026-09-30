@@ -3,21 +3,25 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 import secrets
 import time
 import tomllib
+import urllib.request
 import uuid
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Generator
 
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 from nacl.exceptions import CryptoError
 from nacl.public import Box, PrivateKey, PublicKey
 from pydantic import BaseModel, Field
@@ -37,7 +41,14 @@ CODEX_BIN = os.getenv('CODEX_BIN', '/usr/local/bin/codex')
 CODEX_HOME = Path(os.getenv('CODEX_HOME', '/home/codex/.codex'))
 WORKSPACE = Path(os.getenv('CODEX_WORKSPACE', '/srv/codex/repo'))
 WORKTREES = Path(os.getenv('CODEX_WORKTREES', '/srv/codex/worktrees'))
+UPLOAD_ROOT = Path(os.getenv('CODEX_UPLOADS', '/srv/codex/uploads'))
 CRYPTO_KEY_FILE = Path(os.getenv('CODEX_CRYPTO_KEY_FILE', '/home/codex/.codex/console-crypto-key'))
+MAX_FILE_BYTES = 25 * 1024 * 1024
+MAX_TURN_BYTES = 100 * 1024 * 1024
+USER_UPLOAD_LIMIT = 10 * 1024 * 1024 * 1024
+GLOBAL_UPLOAD_LIMIT = 20 * 1024 * 1024 * 1024
+MIN_FREE_BYTES = 8 * 1024 * 1024 * 1024
+upload_limit_lock = threading.Lock()
 ph = PasswordHasher()
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=3, max_overflow=2, pool_recycle=1800)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
@@ -88,6 +99,23 @@ class TaskEvent(Base):
     event_type: Mapped[str] = mapped_column(String(80))
     payload: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+class Upload(Base):
+    __tablename__ = 'uploads'
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.id'), index=True)
+    original_name: Mapped[str] = mapped_column(String(255))
+    stored_name: Mapped[str] = mapped_column(String(64), unique=True)
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    attached_task_id: Mapped[str | None] = mapped_column(ForeignKey('tasks.id'), nullable=True, index=True)
+
+class TaskAttachment(Base):
+    __tablename__ = 'task_attachments'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey('tasks.id', ondelete='CASCADE'), index=True)
+    upload_id: Mapped[str] = mapped_column(ForeignKey('uploads.id'), index=True)
+    original_name: Mapped[str] = mapped_column(String(255))
 
 app = FastAPI(title='Codex Console', docs_url=None, redoc_url=None)
 
@@ -232,6 +260,49 @@ def user_json(u: User) -> dict:
 def task_json(t: Task) -> dict:
     return {'id': t.id, 'user_id': t.user_id, 'prompt': t.prompt, 'model': t.model, 'reasoning_effort': t.reasoning_effort, 'status': t.status, 'codex_session_id': t.codex_session_id, 'final_output': t.final_output, 'error': t.error, 'created_at': t.created_at.isoformat() + 'Z', 'updated_at': t.updated_at.isoformat() + 'Z'}
 
+def clean_upload_name(name: str) -> str:
+    name = Path((name or 'file').replace('\\', '/')).name
+    name = ''.join(ch for ch in name if ch.isprintable() and ch not in '/\\')
+    name = name.strip(' .')[:180]
+    return name or 'file'
+
+def upload_record(upload: Upload) -> dict:
+    return {'id': upload.id, 'name': upload.original_name, 'size': upload.size_bytes, 'created_at': upload.created_at.isoformat() + 'Z'}
+
+def accept_uploads(db: Session, task: Task, upload_ids: list[str], user_id: int):
+    if len(set(upload_ids)) != len(upload_ids):
+        raise HTTPException(422, '上传文件重复')
+    rows = db.scalars(select(Upload).where(Upload.id.in_(upload_ids), Upload.user_id == user_id, Upload.attached_task_id.is_(None))).all() if upload_ids else []
+    if len(rows) != len(upload_ids):
+        raise HTTPException(404, '部分上传文件不存在、已过期或已被使用')
+    if sum(row.size_bytes for row in rows) > MAX_TURN_BYTES:
+        raise HTTPException(413, '每轮附件总量不能超过 100 MB')
+    for row in rows:
+        row.attached_task_id = task.id
+        db.add(TaskAttachment(task_id=task.id, upload_id=row.id, original_name=row.original_name))
+
+def task_file_root(task: Task) -> Path:
+    if not task.worktree_path:
+        raise HTTPException(404, '任务工作区尚未创建')
+    base = WORKTREES.resolve()
+    root = Path(task.worktree_path).resolve()
+    if base not in root.parents or not root.is_dir():
+        raise HTTPException(404, '任务工作区不存在')
+    return root
+
+def safe_task_file(root: Path, relative: str) -> Path:
+    rel = Path(relative)
+    if rel.is_absolute() or not relative or any(part in ('..', '') for part in rel.parts):
+        raise HTTPException(400, '文件路径不合法')
+    target = root / rel
+    try:
+        resolved = target.resolve(strict=True)
+    except FileNotFoundError:
+        raise HTTPException(404, '文件不存在')
+    if root not in resolved.parents or not resolved.is_file():
+        raise HTTPException(404, '文件不存在')
+    return resolved
+
 def current_user(request: Request, db: Session = Depends(db_dep)) -> User:
     raw = request.cookies.get(COOKIE_NAME)
     if not raw:
@@ -286,6 +357,32 @@ class TaskIn(BaseModel):
     prompt: str = Field(min_length=1, max_length=20000)
     model: str | None = Field(default=None, min_length=1, max_length=128)
     reasoning_effort: str | None = Field(default=None, min_length=1, max_length=16)
+    upload_ids: list[str] = Field(default_factory=list, max_length=20)
+    include_server_snapshot: bool = False
+
+STATUS_AGENT_TOKEN = os.getenv('STATUS_AGENT_TOKEN', '')
+STATUS_AGENTS = json.loads(os.getenv('STATUS_AGENTS', '{}'))
+
+def collect_host_status() -> dict:
+    output = {}
+    for name, url in STATUS_AGENTS.items():
+        request = urllib.request.Request(url.rstrip('/') + '/status', headers={'Authorization': f'Bearer {STATUS_AGENT_TOKEN}'})
+        try:
+            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=4) as response:
+                data = json.loads(response.read(65536))
+            output[name] = {
+                'online': True,
+                'sampled_at': str(data.get('sampled_at', ''))[:40],
+                'cpu_percent': data.get('cpu_percent'),
+                'memory': data.get('memory') if isinstance(data.get('memory'), dict) else {},
+                'disk': data.get('disk') if isinstance(data.get('disk'), dict) else {},
+                'load_average': data.get('load_average') if isinstance(data.get('load_average'), list) else [],
+                'uptime_seconds': data.get('uptime_seconds'),
+                'services': data.get('services') if isinstance(data.get('services'), dict) else {},
+            }
+        except Exception:
+            output[name] = {'online': False, 'sampled_at': None, 'services': {}}
+    return output
 
 
 def ensure_task_settings_columns(db_engine=engine):
@@ -642,6 +739,127 @@ def codex_status() -> dict:
 def system_status(u: User = Depends(require_ready_user)):
     return {'codex': codex_status(), 'workspace_git': (WORKSPACE / '.git').exists(), 'workspace': str(WORKSPACE)}
 
+@app.get('/api/admin/hosts/status')
+def admin_hosts_status(u: User = Depends(admin_user)):
+    return collect_host_status()
+
+@app.get('/api/uploads')
+def list_uploads(u: User = Depends(require_ready_user), db: Session = Depends(db_dep)):
+    rows = db.scalars(select(Upload).where(Upload.user_id == u.id, Upload.attached_task_id.is_(None)).order_by(Upload.created_at.desc()).limit(500)).all()
+    return [upload_record(row) for row in rows]
+
+@app.post('/api/uploads')
+async def upload_file(request: Request, file: UploadFile = File(...), x_csrf_token: str | None = Header(default=None), db: Session = Depends(db_dep), u: User = Depends(require_ready_user)):
+    verify_csrf(request, x_csrf_token)
+    UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+    if shutil.disk_usage(UPLOAD_ROOT).free < MIN_FREE_BYTES:
+        raise HTTPException(507, '服务器可用磁盘空间不足，暂不接受上传')
+    upload_id = str(uuid.uuid4())
+    stored_name = upload_id.replace('-', '')
+    user_dir = UPLOAD_ROOT / str(u.id)
+    user_dir.mkdir(parents=True, exist_ok=True)
+    target = user_dir / stored_name
+    size = 0
+    try:
+        with target.open('xb') as output:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > MAX_FILE_BYTES:
+                    raise HTTPException(413, '单个文件不能超过 25 MB')
+                output.write(chunk)
+        if size == 0:
+            raise HTTPException(422, '不能上传空文件')
+        if shutil.disk_usage(UPLOAD_ROOT).free < MIN_FREE_BYTES:
+            raise HTTPException(507, '上传后可用磁盘空间将低于 8 GB 保护线')
+        with upload_limit_lock:
+            staged_user = db.scalar(select(func.coalesce(func.sum(Upload.size_bytes), 0)).where(Upload.user_id == u.id, Upload.attached_task_id.is_(None))) or 0
+            staged_global = db.scalar(select(func.coalesce(func.sum(Upload.size_bytes), 0)).where(Upload.attached_task_id.is_(None))) or 0
+            if staged_user + size > USER_UPLOAD_LIMIT:
+                raise HTTPException(413, '暂存附件已达到每用户 10 GB 上限')
+            if staged_global + size > GLOBAL_UPLOAD_LIMIT:
+                raise HTTPException(413, '服务器暂存附件已达到 20 GB 上限')
+            row = Upload(id=upload_id, user_id=u.id, original_name=clean_upload_name(file.filename or 'file'), stored_name=stored_name, size_bytes=size)
+            db.add(row)
+            db.commit()
+        return upload_record(row)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    finally:
+        await file.close()
+
+@app.delete('/api/uploads/{upload_id}')
+def delete_upload(upload_id: str, request: Request, x_csrf_token: str | None = Header(default=None), db: Session = Depends(db_dep), u: User = Depends(require_ready_user)):
+    verify_csrf(request, x_csrf_token)
+    row = db.get(Upload, upload_id)
+    if not row or row.user_id != u.id or row.attached_task_id:
+        raise HTTPException(404, '暂存文件不存在')
+    (UPLOAD_ROOT / str(u.id) / row.stored_name).unlink(missing_ok=True)
+    db.delete(row)
+    db.commit()
+    return {'ok': True}
+
+@app.get('/api/tasks/{task_id}/files')
+def list_task_files(task_id: str, u: User = Depends(require_ready_user), db: Session = Depends(db_dep)):
+    task = db.get(Task, task_id)
+    if not task:
+        raise HTTPException(404, '任务不存在')
+    task_allowed(task, u)
+    root = task_file_root(task)
+    proc = subprocess.run(['git', '-C', str(root), 'ls-files', '-co', '--exclude-standard', '-z'], capture_output=True, timeout=20)
+    if proc.returncode:
+        raise HTTPException(500, '无法读取任务文件列表')
+    files = []
+    for raw in proc.stdout.split(b'\0'):
+        if not raw:
+            continue
+        rel = raw.decode('utf-8', errors='replace')
+        try:
+            target = safe_task_file(root, rel)
+        except HTTPException:
+            continue
+        files.append({'path': rel, 'size': target.stat().st_size})
+    return files
+
+@app.get('/api/tasks/{task_id}/files.zip')
+def download_task_files_zip(task_id: str, u: User = Depends(require_ready_user), db: Session = Depends(db_dep)):
+    task = db.get(Task, task_id)
+    if not task:
+        raise HTTPException(404, '任务不存在')
+    task_allowed(task, u)
+    root = task_file_root(task)
+    proc = subprocess.run(['git', '-C', str(root), 'ls-files', '-co', '--exclude-standard', '-z'], capture_output=True, timeout=20)
+    if proc.returncode:
+        raise HTTPException(500, '无法读取任务文件列表')
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(prefix='codex-task-', suffix='.zip', delete=False)
+    tmp.close()
+    try:
+        with zipfile.ZipFile(tmp.name, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+            for raw in proc.stdout.split(b'\0'):
+                if not raw:
+                    continue
+                rel = raw.decode('utf-8', errors='replace')
+                try:
+                    target = safe_task_file(root, rel)
+                except HTTPException:
+                    continue
+                archive.write(target, arcname=rel)
+    except Exception:
+        Path(tmp.name).unlink(missing_ok=True)
+        raise
+    return FileResponse(tmp.name, media_type='application/zip', filename=f'codex-task-{task_id}.zip', background=BackgroundTask(Path(tmp.name).unlink, missing_ok=True))
+
+@app.get('/api/tasks/{task_id}/files/{file_path:path}')
+def download_task_file(task_id: str, file_path: str, u: User = Depends(require_ready_user), db: Session = Depends(db_dep)):
+    task = db.get(Task, task_id)
+    if not task:
+        raise HTTPException(404, '任务不存在')
+    task_allowed(task, u)
+    root = task_file_root(task)
+    target = safe_task_file(root, file_path)
+    return FileResponse(target, filename=Path(file_path).name)
+
 @app.get('/api/codex/models')
 def codex_models(u: User = Depends(require_ready_user)):
     return get_codex_model_catalog()
@@ -649,14 +867,20 @@ def codex_models(u: User = Depends(require_ready_user)):
 @app.post('/api/tasks')
 def create_task(data: TaskIn, request: Request, x_csrf_token: str | None = Header(default=None), db: Session = Depends(db_dep), u: User = Depends(require_ready_user)):
     verify_csrf(request, x_csrf_token)
+    if data.include_server_snapshot and u.role != 'admin':
+        raise HTTPException(403, '服务器诊断快照仅管理员可用')
     validate_task_settings(data.model, data.reasoning_effort)
     if not (WORKSPACE / '.git').exists():
         raise HTTPException(409, '尚未配置 Git 工作区，请先将目标仓库放到服务器工作区')
     status = codex_status()
     if not status.get('authenticated'):
         raise HTTPException(503, status.get('message', '请先在服务器完成 Codex ChatGPT 登录'))
+    snapshot = collect_host_status() if data.include_server_snapshot else None
     t = Task(id=str(uuid.uuid4()), user_id=u.id, prompt=data.prompt.strip(), model=data.model, reasoning_effort=data.reasoning_effort)
     db.add(t)
+    accept_uploads(db, t, data.upload_ids, u.id)
+    if snapshot is not None:
+        db.add(TaskEvent(task_id=t.id, seq=1, event_type='diagnostics.snapshot', payload=json.dumps({'type': 'diagnostics.snapshot', 'data': snapshot}, ensure_ascii=False)))
     db.commit()
     return task_json(t)
 
@@ -717,6 +941,8 @@ def cancel_task(task_id: str, request: Request, x_csrf_token: str | None = Heade
 @app.post('/api/tasks/{task_id}/resume')
 def resume_task(task_id: str, data: TaskIn, request: Request, x_csrf_token: str | None = Header(default=None), db: Session = Depends(db_dep), u: User = Depends(require_ready_user)):
     verify_csrf(request, x_csrf_token)
+    if data.include_server_snapshot and u.role != 'admin':
+        raise HTTPException(403, '服务器诊断快照仅管理员可用')
     old = db.get(Task, task_id)
     if not old:
         raise HTTPException(404, '任务不存在')
@@ -726,8 +952,12 @@ def resume_task(task_id: str, data: TaskIn, request: Request, x_csrf_token: str 
     model = data.model if 'model' in data.model_fields_set else old.model
     reasoning_effort = data.reasoning_effort if 'reasoning_effort' in data.model_fields_set else old.reasoning_effort
     validate_task_settings(model, reasoning_effort)
+    snapshot = collect_host_status() if data.include_server_snapshot else None
     t = Task(id=str(uuid.uuid4()), user_id=u.id, prompt=data.prompt.strip(), model=model, reasoning_effort=reasoning_effort, codex_session_id=old.codex_session_id, resume_requested=True, worktree_path=old.worktree_path)
     db.add(t)
+    accept_uploads(db, t, data.upload_ids, u.id)
+    if snapshot is not None:
+        db.add(TaskEvent(task_id=t.id, seq=1, event_type='diagnostics.snapshot', payload=json.dumps({'type': 'diagnostics.snapshot', 'data': snapshot}, ensure_ascii=False)))
     db.commit()
     return task_json(t)
 

@@ -13,6 +13,8 @@ const setupNeeded=ref(false), loading=ref(true), user=ref<User|null>(null), csrf
 const loginForm=ref({username:'',password:''}), setupForm=ref({token:'',username:'admin',password:''}), passwordForm=ref({current_password:'',new_password:''})
 const tasks=ref<Task[]>([]), prompt=ref(''), currentEvents=ref<UiEvent[]>([]), currentDiff=ref(''), system=ref<any>({}), users=ref<User[]>([]), activeTab=ref('tasks'), userForm=ref({username:'',role:'user'})
 const modelCatalog=ref<ModelCatalog>({available:false,default_model:null,models:[]}), selectedModel=ref(''), selectedEffort=ref(''), selectedTaskId=ref(''), showDiff=ref(false)
+const pendingUploads=ref<any[]>([]), taskFiles=ref<any[]>([]), uploading=ref(false)
+const fileInput=ref<HTMLInputElement|null>(null), hostStatus=ref<Record<string,any>>({}), includeServerSnapshot=ref(false)
 let source:EventSource|null=null, refreshTimer:any=null, codexPoll:any=null
 const deviceLogin=ref<any>({running:false,authenticated:false,device_url:'',user_code:'',message:''})
 const isAdmin=computed(()=>user.value?.role==='admin')
@@ -104,15 +106,17 @@ async function bootstrap(){try{const secret=await encryptSecret({token:setupForm
 async function login(){try{const secret=await encryptSecret({password:loginForm.value.password});const x=await api('/api/auth/login',{method:'POST',body:JSON.stringify({username:loginForm.value.username,secret})});user.value=x.user;csrf.value=x.csrf_token;loginForm.value.password='';if(user.value?.password_change_required){passwordForm.value.current_password='';return}await loadAll()}catch(e:any){ElMessage.error(formatError(e))}}
 async function changePassword(){try{const secret=await encryptSecret(passwordForm.value);const x=await api('/api/auth/password',{method:'POST',body:JSON.stringify({secret})});user.value=x.user;passwordForm.value={current_password:'',new_password:''};ElMessage.success('密码已更新');await loadAll()}catch(e:any){ElMessage.error(formatError(e))}}
 async function logout(){try{await api('/api/auth/logout',{method:'POST'})}catch{}if(source)source.close();user.value=null;csrf.value='';selectedTaskId.value='';tasks.value=[]}
-async function loadAll(){await Promise.all([loadTasks(),loadSystem()]);void loadModels();if(isAdmin.value)await loadUsers();if(!refreshTimer)refreshTimer=setInterval(()=>{loadTasks();loadSystem()},5000)}
+async function loadAll(){await Promise.all([loadTasks(),loadSystem(),loadUploads()]);void loadModels();if(isAdmin.value)await loadUsers();if(!refreshTimer)refreshTimer=setInterval(()=>{loadTasks();loadSystem()},5000)}
 async function loadTasks(){try{tasks.value=await api('/api/tasks')}catch(e:any){if(e.message.includes('登录'))logout()}}
+async function loadUploads(){try{pendingUploads.value=await api('/api/uploads')}catch{}}
 async function loadSystem(){try{system.value=await api('/api/system/status')}catch{}}
+async function loadHostStatus(){try{hostStatus.value=await api('/api/admin/hosts/status');includeServerSnapshot.value=true;ElMessage.success('已采集两台服务器只读状态；发送下一条消息时会附加快照')}catch(e:any){ElMessage.error(formatError(e))}}
 async function loadModels(){try{modelCatalog.value=await api('/api/codex/models')}catch{modelCatalog.value={available:false,default_model:null,models:[],message:'模型目录不可用；仍可使用 Codex 默认设置'}}}
 async function loadUsers(){try{users.value=await api('/api/admin/users')}catch(e:any){ElMessage.error(formatError(e))}}
 async function refreshCodexLogin(){try{deviceLogin.value=await api('/api/admin/codex/login/status');if(deviceLogin.value.authenticated){if(codexPoll)clearInterval(codexPoll);codexPoll=null;await loadSystem();ElMessage.success('ChatGPT 账号已连接')}}catch{}}
 async function startCodexLogin(){try{deviceLogin.value=await api('/api/admin/codex/login/start',{method:'POST'});if(!codexPoll)codexPoll=setInterval(refreshCodexLogin,2000)}catch(e:any){ElMessage.error(formatError(e))}}
 async function cancelCodexLogin(){try{deviceLogin.value=await api('/api/admin/codex/login/cancel',{method:'POST'});if(codexPoll)clearInterval(codexPoll);codexPoll=null}catch(e:any){ElMessage.error(formatError(e))}}
-function newChat(){if(source){source.close();source=null}selectedTaskId.value='';prompt.value='';currentEvents.value=[];currentDiff.value='';selectedModel.value='';selectedEffort.value='';showDiff.value=false}
+function newChat(){if(source){source.close();source=null}selectedTaskId.value='';prompt.value='';currentEvents.value=[];currentDiff.value='';taskFiles.value=[];selectedModel.value='';selectedEffort.value='';showDiff.value=false}
 function changeModel(model:string){selectedModel.value=model;selectedEffort.value=modelCatalog.value.models.find(m=>m.id===model)?.default_effort||''}
 function normalizeEvent(raw:any):UiEvent{const event=raw?.payload||raw;return {seq:raw?.seq??event?.seq,type:event?.type||raw?.event_type||'event',data:event?.data??{},raw}}
 function eventLabel(event:UiEvent):string{
@@ -138,6 +142,7 @@ async function refreshConversationDetail(){
     const detail=await api(`/api/tasks/${latest.id}`)
     currentDiff.value=detail.diff||''
     currentEvents.value=(detail.events||[]).map(normalizeEvent)
+    taskFiles.value=await api(`/api/tasks/${latest.id}/files`).catch(()=>[])
   }catch{}
 }
 async function openConversation(taskId:string){
@@ -160,7 +165,7 @@ async function openConversation(taskId:string){
 async function sendMessage(){
   const message=prompt.value.trim()
   if(!message||conversationBusy.value)return
-  const settings={model:selectedModel.value||null,reasoning_effort:selectedEffort.value||null}
+    const settings={model:selectedModel.value||null,reasoning_effort:selectedEffort.value||null,upload_ids:pendingUploads.value.map(f=>f.id),include_server_snapshot:includeServerSnapshot.value}
   try{
     const conversation=currentConversation.value
     let task:Task
@@ -170,10 +175,32 @@ async function sendMessage(){
       task=await api('/api/tasks',{method:'POST',body:JSON.stringify({prompt:message,...settings})})
     }
     prompt.value=''
+    pendingUploads.value=[]
+    includeServerSnapshot.value=false
     await loadTasks()
     await openConversation(task.id)
   }catch(e:any){ElMessage.error(formatError(e))}
 }
+async function onFilesSelected(event:Event){
+  const input=event.target as HTMLInputElement
+  const files=Array.from(input.files||[]);input.value=''
+  if(!files.length)return
+  uploading.value=true
+  try{
+    for(const file of files){
+      if(file.size>25*1024*1024)throw new Error(`${file.name} 超过 25 MB`)
+      const form=new FormData();form.append('file',file)
+      const headers=new Headers();if(csrf.value)headers.set('X-CSRF-Token',csrf.value)
+      const response=await fetch('/api/uploads',{method:'POST',body:form,headers,credentials:'same-origin'})
+      const result=await response.json().catch(()=>({detail:'上传失败'}))
+      if(!response.ok)throw new Error(formatError(result))
+      pendingUploads.value.push(result)
+    }
+    ElMessage.success(`已上传 ${files.length} 个文件`)
+  }catch(e:any){ElMessage.error(formatError(e))}finally{uploading.value=false}
+}
+async function removeUpload(file:any){try{await api(`/api/uploads/${file.id}`,{method:'DELETE'});pendingUploads.value=pendingUploads.value.filter(f=>f.id!==file.id)}catch(e:any){ElMessage.error(formatError(e))}}
+function downloadHref(filePath:string){return `/api/tasks/${latestTurn.value?.id}/files/${filePath.split('/').map(encodeURIComponent).join('/')}`}
 async function cancelTask(){const task=latestTurn.value;if(!task)return;try{await api(`/api/tasks/${task.id}/cancel`,{method:'POST'});ElMessage.success('已请求取消');await loadTasks()}catch(e:any){ElMessage.error(formatError(e))}}
 async function addUser(){if(!userForm.value.username.trim())return;try{const x=await api('/api/admin/users',{method:'POST',body:JSON.stringify(userForm.value)});await loadUsers();await ElMessageBox.alert(`临时密码：${x.temporary_password}\n请安全复制给用户；首次登录必须修改。`,'用户已创建',{confirmButtonText:'知道了'}) ;userForm.value={username:'',role:'user'}}catch(e:any){ElMessage.error(formatError(e))}}
 async function toggleUser(u:User){try{await api(`/api/admin/users/${u.id}?active=${!u.active}&role=${u.role}`,{method:'PATCH'});await loadUsers()}catch(e:any){ElMessage.error(formatError(e))}}
@@ -181,6 +208,7 @@ async function resetUser(u:User){try{await ElMessageBox.confirm(`重置 ${u.user
 function statusType(s:string){return ({queued:'info',running:'warning',cancel_requested:'warning',succeeded:'success',failed:'danger',cancelled:'info',interrupted:'danger'} as any)[s]||'info'}
 function statusLabel(s:string){return ({queued:'排队中',running:'运行中',cancel_requested:'取消中',succeeded:'已完成',failed:'失败',cancelled:'已取消',interrupted:'已中断'} as any)[s]||s}
 function time(v:string){return v?new Date(v).toLocaleString():'—'}
+function uptime(seconds:number){if(!Number.isFinite(seconds))return '—';const days=Math.floor(seconds/86400),hours=Math.floor(seconds%86400/3600);return `${days}天 ${hours}小时`}
 function handleComposerKeydown(event:KeyboardEvent){if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing){event.preventDefault();void sendMessage()}}
 onMounted(init)
 onUnmounted(()=>{if(source)source.close();if(refreshTimer)clearInterval(refreshTimer);if(codexPoll)clearInterval(codexPoll)})
@@ -194,7 +222,8 @@ onUnmounted(()=>{if(source)source.close();if(refreshTimer)clearInterval(refreshT
   <div v-else class="shell">
     <header class="topbar"><div class="brand"><span class="brand-mark">C</span> Codex 控制台</div><div class="top-actions"><el-tag :type="system.codex?.authenticated?'success':'warning'">{{system.codex?.authenticated?'Codex 已登录':'Codex 未登录'}}</el-tag><span>{{user.username}} · {{user.role==='admin'?'管理员':'用户'}}</span><el-button text @click="logout">退出</el-button></div></header>
     <main class="layout" :class="{'conversation-page':activeTab==='tasks'}"><div class="tabs"><el-button :type="activeTab==='tasks'?'primary':'default'" @click="activeTab='tasks'">对话</el-button><el-button v-if="isAdmin" :type="activeTab==='users'?'primary':'default'" @click="activeTab='users';loadUsers()">用户管理</el-button></div>
-      <template v-if="activeTab==='tasks'"><div v-if="isAdmin" class="card codex-login-card"><div class="section-head"><div><h2>ChatGPT / Codex 账号</h2><div class="muted">使用你的 Plus 账号进行设备登录；无需 API key。授权在 ChatGPT 官方页面完成。</div></div><el-button v-if="!deviceLogin.running" type="primary" @click="startCodexLogin">{{system.codex?.authenticated?'重新登录':'连接 ChatGPT 账号'}}</el-button><el-button v-else type="danger" plain @click="cancelCodexLogin">取消登录</el-button></div><div v-if="deviceLogin.running || deviceLogin.authenticated" class="device-login"><div>{{deviceLogin.message||'等待账号授权'}}</div><div v-if="deviceLogin.user_code" class="device-code">{{deviceLogin.user_code}}</div><el-link v-if="deviceLogin.device_url" :href="deviceLogin.device_url" target="_blank" rel="noopener noreferrer" type="primary">打开 OpenAI 设备授权页面</el-link><div class="muted">在授权页面输入上方代码。不要把设备代码发给他人。</div></div></div><div class="status-line"><span class="dot" :class="system.codex?.authenticated?'ok':'bad'"></span><span>{{system.codex?.message||'正在检查 Codex 状态'}}</span><el-tag v-if="system.workspace_git" size="small" type="success">Git 工作区已配置</el-tag><el-tag v-else size="small" type="warning">尚未配置 Git 仓库</el-tag></div>
+      <template v-if="activeTab==='tasks'"><div v-if="isAdmin" class="card codex-login-card"><div class="section-head"><div><h2>ChatGPT / Codex 账号</h2><div class="muted">使用你的 Plus 账号进行设备登录；无需 API key。授权在 ChatGPT 官方页面完成。</div></div><el-button v-if="!deviceLogin.running" type="primary" @click="startCodexLogin">{{system.codex?.authenticated?'重新登录':'连接 ChatGPT 账号'}}</el-button><el-button v-else type="danger" plain @click="cancelCodexLogin">取消登录</el-button></div><div v-if="deviceLogin.running || deviceLogin.authenticated" class="device-login"><div>{{deviceLogin.message||'等待账号授权'}}</div><div v-if="deviceLogin.user_code" class="device-code">{{deviceLogin.user_code}}</div><el-link v-if="deviceLogin.device_url" :href="deviceLogin.device_url" target="_blank" rel="noopener noreferrer" type="primary">打开 OpenAI 设备授权页面</el-link><div class="muted">在授权页面输入上方代码。不要把设备代码发给他人。</div></div></div><div class="status-line"><span class="dot" :class="system.codex?.authenticated?'ok':'bad'"></span><span>{{system.codex?.message||'正在检查 Codex 状态'}}</span><el-tag v-if="system.workspace_git" size="small" type="success">Git 工作区已配置</el-tag><el-tag v-else size="small" type="warning">尚未配置 Git 仓库</el-tag><el-button v-if="isAdmin" size="small" plain @click="loadHostStatus">检查服务器</el-button><el-tag v-if="includeServerSnapshot" type="success" size="small">本轮将附加诊断快照</el-tag></div>
+        <div v-if="isAdmin&&Object.keys(hostStatus).length" class="host-status-grid"><div v-for="(host,name) in hostStatus" :key="name" class="host-status-card"><b>{{name==='ecs'?'ECS':'轻量服务器'}}</b><el-tag size="small" :type="host.online?'success':'danger'">{{host.online?'在线':'离线'}}</el-tag><template v-if="host.online"><span>CPU {{host.cpu_percent}}% · 内存 {{host.memory?.used_percent}}% · 磁盘 {{host.disk?.used_percent}}%</span><span>负载 {{host.load_average?.slice(0,3).join(' / ')}} · 已运行 {{uptime(host.uptime_seconds)}}</span><span v-for="(state,service) in host.services" :key="service">{{service}} {{state.healthy?'正常':'异常'}}</span></template><span v-else>状态采集器暂不可达</span></div></div>
         <div class="chat-workspace" :class="{'has-diff':showDiff}">
           <aside class="conversation-sidebar">
             <div class="conversation-sidebar-head"><h2>会话</h2><el-button type="primary" size="small" @click="newChat">新建</el-button></div>
@@ -249,14 +278,17 @@ onUnmounted(()=>{if(source)source.close();if(refreshTimer)clearInterval(refreshT
                 <span v-if="modelCatalog.stale" class="muted">模型目录缓存</span>
                 <span v-else-if="!modelCatalog.available" class="muted">{{modelCatalog.message||'可继续使用 Codex 默认模型'}}</span>
               </div>
+              <div v-if="pendingUploads.length" class="upload-chips"><el-tag v-for="file in pendingUploads" :key="file.id" closable @close="removeUpload(file)">{{file.name}} · {{(file.size/1048576).toFixed(1)}} MB</el-tag></div>
               <el-input v-model="prompt" class="chat-input" type="textarea" :autosize="{minRows:2,maxRows:7}" maxlength="20000" placeholder="给 Codex 发送消息…（Enter 发送，Shift+Enter 换行）" @keydown="handleComposerKeydown" />
-              <div class="composer-footer"><span class="muted">{{system.workspace_git?'任务在独立 Git worktree 中运行；不会自动合并或部署。':'尚未配置 Git 工作区'}}</span><el-button type="primary" :disabled="!prompt.trim()||conversationBusy||!system.codex?.authenticated||!system.workspace_git" @click="sendMessage">{{conversationBusy?'本轮运行中…':'发送'}}</el-button></div>
+              <input ref="fileInput" class="hidden-file-input" type="file" multiple @change="onFilesSelected" />
+              <div class="composer-footer"><span class="muted">{{system.workspace_git?'任务在独立 Git worktree 中运行；不会自动合并或部署。':'尚未配置 Git 工作区'}}</span><div class="composer-actions"><el-button plain :loading="uploading" :disabled="conversationBusy" @click="fileInput?.click()">添加文件</el-button><el-button type="primary" :disabled="!prompt.trim()||conversationBusy||!system.codex?.authenticated||!system.workspace_git" @click="sendMessage">{{conversationBusy?'本轮运行中…':'发送'}}</el-button></div></div>
             </div>
           </section>
 
           <aside v-if="showDiff" class="diff-sidebar">
             <div class="diff-header"><div><h2>文件改动</h2><span class="muted">相对仓库 HEAD 的补丁预览</span></div><el-button text @click="showDiff=false">关闭</el-button></div>
             <pre class="diff-content">{{currentDiff||'本会话尚无文件改动'}}</pre>
+            <div class="file-downloads"><div class="file-download-head"><h3>工作区文件</h3><a v-if="latestTurn" :href="`/api/tasks/${latestTurn.id}/files.zip`">下载 ZIP</a></div><div v-if="taskFiles.length" class="file-download-list"><div v-for="file in taskFiles" :key="file.path" class="file-download-row"><span :title="file.path">{{file.path}}</span><a :href="downloadHref(file.path)" download>下载</a></div></div><span v-else class="muted">任务运行后可下载文件</span></div>
             <p class="muted">改动保存在独立 worktree 中，不会自动合并或部署。</p>
           </aside>
         </div></template>

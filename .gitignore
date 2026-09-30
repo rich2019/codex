@@ -1,6 +1,7 @@
 .env
 .env.*
 !.env.example
+!.env.light.example
 state/
 backend/__pycache__/
 frontend/node_modules/
