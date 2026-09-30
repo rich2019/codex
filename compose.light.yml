@@ -39,7 +39,7 @@ services:
       BOOTSTRAP_TOKEN: ${BOOTSTRAP_TOKEN}
       COOKIE_SECURE: "false"
       CODEX_STATUS_FILE: /state/codex_status.json
-      CODEX_WORKSPACE: /srv/codex/repo
+      CODEX_WORKSPACE: /srv/codex/projects/rich2019-codex
       CODEX_WORKTREES: /srv/codex/worktrees
       CODEX_UPLOADS: /srv/codex/uploads
       CODEX_CRYPTO_KEY_FILE: /home/codex/.codex/console-crypto-key
@@ -75,7 +75,7 @@ services:
       all_proxy: http://mihomo:7890
       no_proxy: localhost,127.0.0.1,::1,mysql,mihomo,status-agent,172.24.53.149,10.0.7.126
       CODEX_STATUS_FILE: /state/codex_status.json
-      CODEX_WORKSPACE: /srv/codex/repo
+      CODEX_WORKSPACE: /srv/codex/projects/rich2019-codex
       CODEX_WORKTREES: /srv/codex/worktrees
       CODEX_UPLOADS: /srv/codex/uploads
       MAX_TASK_SECONDS: "7200"
