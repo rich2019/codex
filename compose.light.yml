@@ -18,7 +18,7 @@ services:
     mem_limit: 480m
     networks: [backend]
   api:
-    image: codex-console-backend:67634eb
+    image: codex-console-backend:f9e7591
     build:
       context: ./backend
     restart: unless-stopped
@@ -58,7 +58,7 @@ services:
     mem_limit: 160m
     networks: [backend]
   worker:
-    image: codex-console-backend:67634eb
+    image: codex-console-backend:f9e7591
     restart: unless-stopped
     command: ["python", "worker.py"]
     environment:
