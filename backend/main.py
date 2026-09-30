@@ -14,6 +14,7 @@ import uuid
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Generator
 
 from argon2 import PasswordHasher
@@ -844,7 +845,10 @@ def download_task_files_zip(task_id: str, u: User = Depends(require_ready_user),
                     target = safe_task_file(root, rel)
                 except HTTPException:
                     continue
-                archive.write(target, arcname=rel)
+                archive_name = rel.replace('\\', '/')
+                if PurePosixPath(archive_name).is_absolute() or '..' in PurePosixPath(archive_name).parts:
+                    continue
+                archive.write(target, arcname=archive_name)
     except Exception:
         Path(tmp.name).unlink(missing_ok=True)
         raise
