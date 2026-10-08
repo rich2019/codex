@@ -178,8 +178,8 @@ def run_task(task):
         path = prepare_worktree(task)
         command = task_command(task)
         env = os.environ.copy()
-        env['HOME'] = '/home/codex'
-        env['CODEX_HOME'] = '/home/codex/.codex'
+        env['HOME'] = os.getenv('HOME') or '/home/codex'
+        env['CODEX_HOME'] = os.getenv('CODEX_HOME') or str(Path(env['HOME']) / '.codex')
         proc = subprocess.Popen(command, cwd=path, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
         sel = selectors.DefaultSelector()
         sel.register(proc.stdout, selectors.EVENT_READ)
